@@ -734,7 +734,7 @@ let tweaks = {
 };
 
 
-function createTweakList(name, keys, vals) {
+function createTweakList(container, name, keys, vals) {
     const opts = [];
     for (let i = 0; i < keys.length; i++) {
         const k = keys[i];
@@ -742,11 +742,11 @@ function createTweakList(name, keys, vals) {
         opts.push({ text: k, value: v });
     }
 
-    return pane.addBlade({
+    return container.addBlade({
         view: 'list', label: name,
         options: opts,
         value: vals[0]
-    })
+    });
 }
 
 
@@ -765,9 +765,15 @@ function handleMeshChange(geo) {
 }
 
 
-const pane = new Pane();
-const controller = pane.addFolder({ title: "Controls", expanded: false });
+const controlsContainer = document.getElementById('controls');
+if (!controlsContainer) throw new Error('Controls container was not found.');
 
+const pane = new Pane({
+    title: 'Controls',
+    expanded: true,
+    container: controlsContainer,
+});
+const controller = pane;
 
 const audioFolder = controller.addFolder({ title: "Audio", expanded: true });
 audioFolder.addButton({ title: "Load Audio" }).on('click', () => audioFileInput.click());
@@ -781,9 +787,8 @@ audioFolder.addBinding(audioReactive, "bloomResponse", { min: 0, max: 5, step: 0
 
 
 const meshFolder = controller.addFolder({ title: "Mesh", expanded: false });
-let meshBlade = createTweakList('Mesh', geoNames, geometries);
-meshBlade.on('change', (val) => { handleMeshChange(val.value) })
-meshFolder.add(meshBlade);
+let meshBlade = createTweakList(meshFolder, 'Mesh', geoNames, geometries);
+meshBlade.on('change', (val) => { handleMeshChange(val.value) });
 meshFolder.addBinding(tweaks, "bloomStrength", { min: 1, max: 20, step: 0.01, label: "Bloom Strength" }).on('change', (obj) => { shaderPass.uniforms.uStrength.value = obj.value; })
 meshFolder.addBinding(tweaks, "rotationY", { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: "Rotation Y" }).on('change', (obj) => { particleMesh.rotation.y = mesh.rotation.y = obj.value; });
 
