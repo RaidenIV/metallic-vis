@@ -105,7 +105,8 @@ scene.background = blackColor;
 
 
 const re = new THREE.WebGLRenderer({ canvas: cnvs, antialias: true });
-re.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+const displayPixelRatio = Math.min(window.devicePixelRatio, 2);
+re.setPixelRatio(displayPixelRatio);
 re.setSize(cnvs.clientWidth * scale, cnvs.clientHeight * scale, false);
 re.toneMapping = THREE.CineonToneMapping;
 re.outputColorSpace = THREE.SRGBColorSpace;
@@ -2170,9 +2171,11 @@ function setupDissolveShader(shader) {
         ${snoise}
     `);
 
-    // fragment shader snippet inside main
-    shader.fragmentShader = shader.fragmentShader.replace('#include <dithering_fragment>', `#include <dithering_fragment>
-
+    // Apply the dissolve before Three.js tone mapping / output-color conversion.
+    // Writing gl_FragColor after those stages made the emissive edge get processed
+    // inconsistently by the post-processing/export pipeline, which could encode it
+    // as a dark/black contour in captured video.
+    shader.fragmentShader = shader.fragmentShader.replace('#include <opaque_fragment>', `
         float motionCos = cos(uMotionAngle);
         float motionSin = sin(uMotionAngle);
         vec3 rotatedNoisePos = vec3(
@@ -2195,15 +2198,18 @@ function setupDissolveShader(shader) {
         vec3 movingNoisePos = tiltedNoisePos + uMotionOffset;
         float noise = snoise(movingNoisePos * uFreq) * uAmp;
 
-        if(noise < uProgress) discard; // discard any fragment where noise is lower than progress
+        if(noise < uProgress) discard;
 
         float edgeWidth = uProgress + uEdge;
-
         if(noise > uProgress && noise < edgeWidth){
-            gl_FragColor = vec4(vec3(uEdgeColor) * uEdgeBloomBoost, noise); // colors the edge and feeds reactive bloom
-        }else{
-            gl_FragColor = vec4(gl_FragColor.xyz,1.0);
+            // Replace the lit surface with the emissive dissolve color while the
+            // value is still linear/HDR. The normal opaque, tone-mapping and
+            // color-space chunks below now process screen and exported frames alike.
+            outgoingLight = uEdgeColor * uEdgeBloomBoost;
+            diffuseColor.a = 1.0;
         }
+
+        #include <opaque_fragment>
     `);
 
 }
@@ -2507,14 +2513,26 @@ scene.add(particleMesh);
 function resizeRendererToDisplaySize() {
     const width = exportOverrideSize ? exportOverrideSize.width : cnvs.clientWidth * scale;
     const height = exportOverrideSize ? exportOverrideSize.height : cnvs.clientHeight * scale;
-    const needResize = cnvs.width !== width || cnvs.height !== height;
+
+    // Export dimensions are already physical output pixels. Rendering them again
+    // at the display DPR (often 2x) made a 1080p export render internally at up to
+    // 2160p and, because canvas.width no longer matched `width`, forced every
+    // composer/render target to be resized on every animation frame. That causes
+    // heavy allocation churn and visible judder in moving/rotating backgrounds.
+    const targetPixelRatio = exportOverrideSize ? 1 : displayPixelRatio;
+    const drawingWidth = Math.max(1, Math.floor(width * targetPixelRatio));
+    const drawingHeight = Math.max(1, Math.floor(height * targetPixelRatio));
+    const pixelRatioChanged = Math.abs(re.getPixelRatio() - targetPixelRatio) > 1e-6;
+    const needResize = pixelRatioChanged || cnvs.width !== drawingWidth || cnvs.height !== drawingHeight;
+
     if (needResize) {
+        if (pixelRatioChanged) {
+            re.setPixelRatio(targetPixelRatio);
+            effectComposer1.setPixelRatio(targetPixelRatio);
+            effectComposer2.setPixelRatio(targetPixelRatio);
+        }
+
         re.setSize(width, height, false);
-
-        renderPass.setSize(width, height);
-        outPass.setSize(width, height);
-        unrealBloomPass.setSize(width, height);
-
         effectComposer1.setSize(width, height);
         effectComposer2.setSize(width, height);
     }
@@ -2662,7 +2680,7 @@ function setCameraFromSpherical(distance, elevationDeg, azimuthDeg) {
     cam.lookAt(orbCtrls.target);
 }
 
-function updateCameraMotion(time, audio) {
+function updateCameraMotion(time, audio, delta) {
     orbCtrls.enabled = cameraSettings.mouseControls;
     orbCtrls.enableDamping = cameraSettings.damping;
     orbCtrls.autoRotate = cameraSettings.autoRotate && cameraSettings.preset === 'Static';
@@ -2676,7 +2694,7 @@ function updateCameraMotion(time, audio) {
             setCameraFromSpherical(cameraSettings.distance, cameraSettings.elevation, cameraSettings.azimuth);
             cameraSettingsDirty = false;
         }
-        orbCtrls.update();
+        orbCtrls.update(delta);
         return;
     }
 
@@ -2770,7 +2788,7 @@ function updateCameraMotion(time, audio) {
 
     cam.position.set(x, y, z);
     cam.lookAt(orbCtrls.target);
-    orbCtrls.update();
+    orbCtrls.update(delta);
 }
 
 const exportSettings = {
@@ -2995,7 +3013,9 @@ async function startVideoExport() {
 
     const frameRate = Number(exportSettings.frameRate) || 60;
     const canvasStream = cnvs.captureStream(frameRate);
-    const tracks = [...canvasStream.getVideoTracks()];
+    const videoTrack = canvasStream.getVideoTracks()[0];
+    if (videoTrack && 'contentHint' in videoTrack) videoTrack.contentHint = 'motion';
+    const tracks = videoTrack ? [videoTrack] : [];
     if (recordingDestination?.stream?.getAudioTracks().length) {
         tracks.push(...recordingDestination.stream.getAudioTracks());
     }
@@ -3512,7 +3532,7 @@ function animate() {
     // the swarm accelerates with the track and settles back in silence.
     particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.level * audioReactive.particleSpeedResponse);
 
-    updateCameraMotion(time, audio);
+    updateCameraMotion(time, audio, animationDelta);
 
     updateParticleAttributes();
 
