@@ -95,6 +95,108 @@ const orbCtrls = new OrbitControls(cam, cnvs);
 //document.body.appendChild(stat.dom);
 
 
+// Audio-reactive layer. The selected file stays local to the browser and is
+// analysed with the Web Audio API; the original visual effect remains intact.
+const audioElement = new Audio();
+audioElement.preload = 'metadata';
+
+const audioFileInput = document.createElement('input');
+audioFileInput.type = 'file';
+audioFileInput.accept = 'audio/*';
+audioFileInput.hidden = true;
+document.body.appendChild(audioFileInput);
+
+let audioContext: AudioContext | null = null;
+let audioAnalyser: AnalyserNode | null = null;
+let audioSource: MediaElementAudioSourceNode | null = null;
+let audioFrequencyData: Uint8Array | null = null;
+let audioObjectUrl: string | null = null;
+
+const audioReactive = {
+    sensitivity: 1.35,
+    smoothing: 0.78,
+    dissolveResponse: 4.5,
+    particleResponse: 2.0,
+    bloomResponse: 1.8,
+};
+
+function ensureAudioAnalyser() {
+    if (!audioContext) {
+        audioContext = new AudioContext();
+    }
+
+    if (!audioAnalyser) {
+        audioAnalyser = audioContext.createAnalyser();
+        audioAnalyser.fftSize = 1024;
+        audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
+        audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
+    }
+
+    if (!audioSource) {
+        audioSource = audioContext.createMediaElementSource(audioElement);
+        audioSource.connect(audioAnalyser);
+        audioAnalyser.connect(audioContext.destination);
+    }
+}
+
+function getBandLevel(minHz: number, maxHz: number) {
+    if (!audioAnalyser || !audioFrequencyData || !audioContext) return 0;
+
+    const nyquist = audioContext.sampleRate / 2;
+    const firstBin = Math.max(0, Math.floor((minHz / nyquist) * audioFrequencyData.length));
+    const lastBin = Math.min(audioFrequencyData.length - 1, Math.ceil((maxHz / nyquist) * audioFrequencyData.length));
+    if (lastBin < firstBin) return 0;
+
+    let total = 0;
+    for (let i = firstBin; i <= lastBin; i++) total += audioFrequencyData[i];
+    return (total / (lastBin - firstBin + 1)) / 255;
+}
+
+function readAudioLevels() {
+    if (!audioAnalyser || !audioFrequencyData || audioElement.paused) {
+        return { bass: 0, mids: 0, highs: 0, level: 0 };
+    }
+
+    audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
+    audioAnalyser.getByteFrequencyData(audioFrequencyData);
+
+    const sensitivity = audioReactive.sensitivity;
+    const bass = Math.min(1, getBandLevel(20, 180) * sensitivity);
+    const mids = Math.min(1, getBandLevel(180, 2200) * sensitivity);
+    const highs = Math.min(1, getBandLevel(2200, 12000) * sensitivity);
+    const level = Math.min(1, ((bass * 0.5) + (mids * 0.3) + (highs * 0.2)));
+
+    return { bass, mids, highs, level };
+}
+
+async function toggleAudioPlayback() {
+    if (!audioElement.src) {
+        audioFileInput.click();
+        return;
+    }
+
+    ensureAudioAnalyser();
+    if (audioContext?.state === 'suspended') await audioContext.resume();
+
+    if (audioElement.paused) await audioElement.play();
+    else audioElement.pause();
+}
+
+audioFileInput.addEventListener('change', async () => {
+    const file = audioFileInput.files?.[0];
+    if (!file) return;
+
+    if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+    audioObjectUrl = URL.createObjectURL(file);
+    audioElement.src = audioObjectUrl;
+    audioElement.load();
+
+    ensureAudioAnalyser();
+    if (audioContext?.state === 'suspended') await audioContext.resume();
+    await audioElement.play();
+});
+
+
 const cubeRenderTarget = new THREE.WebGLCubeRenderTarget(256);
 const cubeCamera = new THREE.CubeCamera(0.1, 500, cubeRenderTarget);
 //let lightProbe = new THREE.LightProbe();
@@ -548,6 +650,16 @@ const pane = new Pane();
 const controller = pane.addFolder({ title: "Controls", expanded: false });
 
 
+const audioFolder = controller.addFolder({ title: "Audio", expanded: true });
+audioFolder.addButton({ title: "Load Audio" }).on('click', () => audioFileInput.click());
+audioFolder.addButton({ title: "Play / Pause" }).on('click', () => { void toggleAudioPlayback(); });
+audioFolder.addBinding(audioReactive, "sensitivity", { min: 0.1, max: 4, step: 0.01, label: "Sensitivity" });
+audioFolder.addBinding(audioReactive, "smoothing", { min: 0, max: 0.95, step: 0.01, label: "Smoothing" });
+audioFolder.addBinding(audioReactive, "dissolveResponse", { min: 0, max: 10, step: 0.01, label: "Dissolve" });
+audioFolder.addBinding(audioReactive, "particleResponse", { min: 0, max: 5, step: 0.01, label: "Particles" });
+audioFolder.addBinding(audioReactive, "bloomResponse", { min: 0, max: 5, step: 0.01, label: "Bloom" });
+
+
 const meshFolder = controller.addFolder({ title: "Mesh", expanded: false });
 let meshBlade = createTweakList('Mesh', geoNames, geometries);
 //@ts-ignore
@@ -615,11 +727,27 @@ function animate() {
 
     let time = clock.getElapsedTime();
 
+    animateDissolve();
+
+    // Keep the existing tweak values as the baseline and temporarily layer audio
+    // response on top for this frame. This avoids audio permanently overwriting
+    // any of the original controls.
+    const baseProgress = dissolveUniformData.uProgress.value;
+    const baseEdge = dissolveUniformData.uEdge.value;
+    const baseParticleSpeed = particleData.particleSpeedFactor;
+    const baseWaveAmplitude = particleData.waveAmplitude;
+    const baseBloomStrength = shaderPass.uniforms.uStrength.value;
+
+    const audio = readAudioLevels();
+    dissolveUniformData.uProgress.value = baseProgress + (audio.bass * audioReactive.dissolveResponse);
+    dissolveUniformData.uEdge.value = baseEdge * (1 + audio.highs * 0.6);
+    particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.mids * audioReactive.particleResponse);
+    particleData.waveAmplitude = baseWaveAmplitude + (audio.bass * audioReactive.particleResponse);
+    shaderPass.uniforms.uStrength.value = baseBloomStrength * (1 + audio.level * audioReactive.bloomResponse);
+
     updateParticleAttriutes();
 
     floatMeshes(time);
-
-    animateDissolve();
 
     if (resizeRendererToDisplaySize()) {
         const canvas = re.domElement;
@@ -633,6 +761,15 @@ function animate() {
 
     scene.background = cubeTexture;
     effectComposer2.render();
+
+    // Restore the original control values after rendering so the audio layer is
+    // non-destructive and Auto Animate continues to operate exactly as before.
+    dissolveUniformData.uProgress.value = baseProgress;
+    dissolveUniformData.uEdge.value = baseEdge;
+    particleData.particleSpeedFactor = baseParticleSpeed;
+    particleData.waveAmplitude = baseWaveAmplitude;
+    shaderPass.uniforms.uStrength.value = baseBloomStrength;
+
     requestAnimationFrame(animate);
 }
 requestAnimationFrame(animate);
