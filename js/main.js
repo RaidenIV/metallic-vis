@@ -1814,6 +1814,10 @@ const backgroundPresets = {
     'Creek': { type: 'cube', prefix: new URL('../assets/backgrounds/Creek/', import.meta.url).href, postfix: '.jpg' },
     'Grass': { type: 'image', url: new URL('../assets/backgrounds/Grass/Grass.jpg', import.meta.url).href },
     'Stones': { type: 'image', url: new URL('../assets/backgrounds/Stones/Stones.jpg', import.meta.url).href },
+    'Blue Slate': { type: 'image', url: new URL('../assets/backgrounds/BlueSlate/BlueSlate.jpg', import.meta.url).href },
+    'Molten Rock': { type: 'image', url: new URL('../assets/backgrounds/MoltenRock/MoltenRock.jpg', import.meta.url).href },
+    'Volcanic Eruption': { type: 'image', url: new URL('../assets/backgrounds/VolcanicEruption/VolcanicEruption.jpg', import.meta.url).href },
+    'Violet Flux': { type: 'image', url: new URL('../assets/backgrounds/VioletFlux/VioletFlux.jpg', import.meta.url).href },
     'Ryfjallet': { type: 'cube', prefix: new URL('../assets/backgrounds/Ryfjallet/', import.meta.url).href, postfix: '.jpg' },
     'Ice River': { type: 'cube', prefix: new URL('../assets/backgrounds/IceRiver/', import.meta.url).href, postfix: '.jpg' },
     'Hornstulls Strand': { type: 'cube', prefix: new URL('../assets/backgrounds/HornstullsStrand/', import.meta.url).href, postfix: '.jpg' },
@@ -3504,3 +3508,4 @@ window.addEventListener('orientationchange', () => {
     fitViewport();
     cameraSettingsDirty = true;
 });
+
