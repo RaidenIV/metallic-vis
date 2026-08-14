@@ -284,23 +284,63 @@ function generateCubeUrls(prefix, postfix) {
 
 
 const cubeMap2Url = new URL('../assets/cubeMap2/', import.meta.url).href;
-cubeTextureUrls = generateCubeUrls(cubeMap2Url, '.png');
+
+const backgroundPresets = {
+    'Original': { type: 'cube', prefix: cubeMap2Url, postfix: '.png' },
+    'Football Field 2': { type: 'cube', prefix: new URL('../assets/backgrounds/Footballfield2/', import.meta.url).href, postfix: '.jpg' },
+    'Swedish Royal Castle': { type: 'cube', prefix: new URL('../assets/backgrounds/SwedishRoyalCastle/', import.meta.url).href, postfix: '.jpg' },
+    'Creek': { type: 'cube', prefix: new URL('../assets/backgrounds/Creek/', import.meta.url).href, postfix: '.jpg' },
+    'Grass': { type: 'image', url: new URL('../assets/backgrounds/Grass/Grass.jpg', import.meta.url).href },
+    'Stones': { type: 'image', url: new URL('../assets/backgrounds/Stones/Stones.jpg', import.meta.url).href },
+    'Ryfjallet': { type: 'cube', prefix: new URL('../assets/backgrounds/Ryfjallet/', import.meta.url).href, postfix: '.jpg' },
+    'Ice River': { type: 'cube', prefix: new URL('../assets/backgrounds/IceRiver/', import.meta.url).href, postfix: '.jpg' },
+    'Hornstulls Strand': { type: 'cube', prefix: new URL('../assets/backgrounds/HornstullsStrand/', import.meta.url).href, postfix: '.jpg' },
+    'Tantolunden': { type: 'cube', prefix: new URL('../assets/backgrounds/Tantolunden/', import.meta.url).href, postfix: '.jpg' },
+    'Vindelalven': { type: 'cube', prefix: new URL('../assets/backgrounds/Vindelalven/', import.meta.url).href, postfix: '.jpg' },
+    'Yokohama 3': { type: 'cube', prefix: new URL('../assets/backgrounds/Yokohama3/', import.meta.url).href, postfix: '.jpg' },
+};
+const backgroundNames = Object.keys(backgroundPresets);
+const backgroundTextureCache = new Map();
+let defaultEnvironmentTexture = null;
+
+
+async function loadBackground(name) {
+    const preset = backgroundPresets[name];
+    if (!preset) return;
+
+    let texture = backgroundTextureCache.get(name);
+    if (!texture) {
+        if (preset.type === 'cube') {
+            cubeTextureUrls = generateCubeUrls(preset.prefix, preset.postfix);
+            texture = await new THREE.CubeTextureLoader().loadAsync(cubeTextureUrls);
+        } else {
+            texture = await new THREE.TextureLoader().loadAsync(preset.url);
+        }
+        texture.colorSpace = THREE.SRGBColorSpace;
+        backgroundTextureCache.set(name, texture);
+    }
+
+    if (name === 'Original' && preset.type === 'cube' && !defaultEnvironmentTexture) {
+        defaultEnvironmentTexture = texture;
+    }
+
+    scene.background = texture;
+    if (preset.type === 'cube') {
+        cubeTexture = texture;
+        scene.environment = texture;
+    } else {
+        scene.environment = defaultEnvironmentTexture || cubeTexture;
+    }
+
+    cubeCamera.update(re, scene);
+    document.body.classList.remove("loading");
+}
 
 
 async function loadTextures() {
-
-    const cubeTextureLoader = new THREE.CubeTextureLoader();
-    cubeTexture = await cubeTextureLoader.loadAsync(cubeTextureUrls);
-
-    scene.background = cubeTexture;
-    scene.environment = cubeTexture;
-
-    cubeCamera.update(re, scene);
-
-    document.body.classList.remove("loading");
+    await loadBackground('Original');
     //lightProbe = await LightProbeGenerator.fromCubeRenderTarget(re, cubeRenderTarget);
     //scene.add(lightProbe);
-
 }
 
 
@@ -784,6 +824,11 @@ audioFolder.addBinding(audioReactive, "shapeResponse", { min: 0, max: 2.5, step:
 audioFolder.addBinding(audioReactive, "dissolveResponse", { min: 0, max: 10, step: 0.01, label: "Dissolve" });
 audioFolder.addBinding(audioReactive, "particleResponse", { min: 0, max: 5, step: 0.01, label: "Particles" });
 audioFolder.addBinding(audioReactive, "bloomResponse", { min: 0, max: 5, step: 0.01, label: "Bloom" });
+
+
+const backgroundFolder = controller.addFolder({ title: "Background", expanded: false });
+const backgroundBlade = createTweakList(backgroundFolder, 'Background', backgroundNames, backgroundNames);
+backgroundBlade.on('change', (event) => { void loadBackground(event.value); });
 
 
 const meshFolder = controller.addFolder({ title: "Mesh", expanded: false });
