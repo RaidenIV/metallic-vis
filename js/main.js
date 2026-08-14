@@ -1829,7 +1829,55 @@ const backgroundPresets = {
 };
 const backgroundNames = Object.keys(backgroundPresets);
 const backgroundTextureCache = new Map();
+// Flat-image backgrounds were pinned to the original cubemap for reflections, so
+// nothing the user selected ever showed up in the metal. Non-cube backgrounds now
+// get a real pre-filtered environment map built from the same image.
+const backgroundEnvironmentCache = new Map();
+let pmremGenerator = null;
 let defaultEnvironmentTexture = null;
+
+// PMREMGenerator sizes its cube from source width / 4, so a 3840px background
+// would allocate a 2880x3840 half-float target (~88 MB, twice over with the
+// ping-pong buffer). Downsampling the source to 1024 lands on the 256px cube
+// three documents as ideal and keeps the allocation near 6 MB.
+function createEnvironmentSource(image) {
+    const maxWidth = 1024;
+    const sourceWidth = image.width || image.videoWidth || maxWidth;
+    const sourceHeight = image.height || image.videoHeight || maxWidth;
+    const width = Math.min(maxWidth, sourceWidth);
+    const height = Math.max(1, Math.round((sourceHeight / sourceWidth) * width));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext('2d').drawImage(image, 0, 0, width, height);
+
+    const source = new THREE.CanvasTexture(canvas);
+    source.colorSpace = THREE.SRGBColorSpace;
+    return source;
+}
+
+// PMREMGenerator treats any non-cube texture as equirectangular, so the
+// background texture itself needs no mapping change and scene.background keeps
+// rendering exactly as before.
+function getBackgroundEnvironment(name, texture) {
+    const cached = backgroundEnvironmentCache.get(name);
+    if (cached) return cached.texture;
+
+    const image = texture.image;
+    if (!image || !(image.width || image.videoWidth)) return null;
+
+    if (!pmremGenerator) pmremGenerator = new THREE.PMREMGenerator(re);
+
+    const source = createEnvironmentSource(image);
+    try {
+        const target = pmremGenerator.fromEquirectangular(source);
+        backgroundEnvironmentCache.set(name, target);
+        return target.texture;
+    } finally {
+        source.dispose();
+    }
+}
 let activeBackgroundTexture = null;
 
 
@@ -1878,10 +1926,14 @@ async function loadBackground(name) {
         if (preset.type === 'cube') {
             cubeTexture = texture;
             scene.environment = texture;
-        } else if (preset.type === 'equirect') {
-            scene.environment = texture;
         } else {
-            scene.environment = defaultEnvironmentTexture || cubeTexture;
+            let environment = null;
+            try {
+                environment = getBackgroundEnvironment(name, texture);
+            } catch (environmentError) {
+                console.warn(`Environment map could not be generated for ${name}.`, environmentError);
+            }
+            scene.environment = environment || defaultEnvironmentTexture || cubeTexture;
         }
 
         cubeCamera.update(re, scene);
@@ -3508,4 +3560,3 @@ window.addEventListener('orientationchange', () => {
     fitViewport();
     cameraSettingsDirty = true;
 });
-
