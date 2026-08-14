@@ -6,6 +6,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -281,6 +282,9 @@ const loopSettings = {
     bpm: 120,
     bars: 4,
     snapToBeats: true,
+    // Set once the user types a tempo in the loop modal. While true, automatic
+    // detection must never overwrite it.
+    bpmUserSet: false,
 };
 
 let decodedAudioBuffer = null;
@@ -324,10 +328,22 @@ function refreshSeekBinding() {
 function refreshPane() {
     if (!pane) return;
     suppressSeekBindingChange = true;
+    suppressRotationYChange = true;
     try {
         pane.refresh();
     } finally {
         suppressSeekBindingChange = false;
+        suppressRotationYChange = false;
+    }
+}
+
+function refreshRotationYBinding() {
+    if (!rotationYBinding) return;
+    suppressRotationYChange = true;
+    try {
+        rotationYBinding.refresh();
+    } finally {
+        suppressRotationYChange = false;
     }
 }
 
@@ -614,6 +630,7 @@ async function loadAudioFile(file) {
     loopSettings.enabled = false;
     loopSettings.start = 0;
     loopSettings.end = 0;
+    loopSettings.bpmUserSet = false;
     refreshAudioInfo();
     galaxyLoopController?.syncButton?.();
 
@@ -1010,6 +1027,7 @@ const galaxyLoopController = (() => {
       $('popup-apply-btn').addEventListener('click', () => {
           applyAudioLoop(popupLoopStart, popupLoopEnd);
           loopSettings.bpm = popupBpm;
+          loopSettings.bpmUserSet = true;
           syncLoopControlButton();
           closePopup();
       });
@@ -1272,6 +1290,10 @@ const galaxyLoopController = (() => {
 
       // The editor is usable now; tempo refinement happens in the background.
       analyzing?.classList.remove('show');
+
+      // A user-entered tempo is authoritative. Skip detection outright so no
+      // late-arriving analysis can overwrite the number in the BPM field.
+      if (loopSettings.bpmUserSet) return;
 
       const bufferAtDetectionStart = popupBuffer;
       try {
@@ -1558,6 +1580,10 @@ const galaxyLoopController = (() => {
       const v = +$('popup-bpm-input').value;
       if (v >= 40 && v <= 300) {
           popupBpm = v;
+          // Persist immediately, not only on Apply, so the tempo survives a
+          // Cancel and is restored the next time the modal opens.
+          loopSettings.bpm = popupBpm;
+          loopSettings.bpmUserSet = true;
           $('popup-stat-beat').textContent = (60 / popupBpm).toFixed(3) + 's';
           applyLoopChange($);
       } else { $('popup-bpm-input').value = popupBpm; }
@@ -1881,13 +1907,18 @@ const teaPot = new TeapotGeometry(3, segments2);
 const torus = new THREE.TorusGeometry(3, 1.5, segments1, segments1);
 const torusKnot = new THREE.TorusKnotGeometry(2.5, 0.8, segments1, segments1);
 const polyDetail = isMobileDevice() ? 2 : 3;
-const boxSegments = isMobileDevice() ? 18 : 32;
+const boxSegments = isMobileDevice() ? 4 : 6;
+const boxCornerRadius = 0.9;
 const radialSegments = isMobileDevice() ? 48 : 72;
 const heightSegments = isMobileDevice() ? 18 : 32;
 const icosahedron = new THREE.IcosahedronGeometry(4.5, polyDetail);
 const dodecahedron = new THREE.DodecahedronGeometry(4.5, polyDetail);
 const octahedron = new THREE.OctahedronGeometry(4.5, polyDetail + 1);
-const cube = new THREE.BoxGeometry(7.2, 7.2, 7.2, boxSegments, boxSegments, boxSegments);
+// Rounded corners. RoundedBoxGeometry expands its segment count to
+// segments * 2 + 1 and returns a non-indexed buffer, so 6 segments lands at
+// 6084 vertices — close to the 6534 the previous 32-segment BoxGeometry fed
+// into the particle system, keeping particle density unchanged.
+const cube = new RoundedBoxGeometry(7.2, 7.2, 7.2, boxSegments, boxCornerRadius);
 const cylinder = new THREE.CylinderGeometry(3.5, 3.5, 7.0, radialSegments, heightSegments, false);
 const cone = new THREE.ConeGeometry(4.0, 7.5, radialSegments, heightSegments, false);
 
@@ -1931,6 +1962,71 @@ phyMat.color = new THREE.Color(0x636363);
 phyMat.metalness = 2.0;
 phyMat.roughness = 0.0;
 phyMat.side = THREE.DoubleSide;
+
+// Surface presets. Only appearance properties are touched — colour, side and
+// the dissolve shader injection stay under their existing controls. 'Metallic'
+// reproduces the original material exactly.
+const materialPresets = {
+    'Metallic': {
+        metalness: 2.0, roughness: 0.0, transmission: 0.0, thickness: 0.0,
+        ior: 1.5, iridescence: 0.0, clearcoat: 0.0, clearcoatRoughness: 0.0,
+        specularIntensity: 1.0, envMapIntensity: 1.0,
+        attenuationDistance: Infinity, attenuationColor: 0xffffff,
+    },
+    'Chrome': {
+        metalness: 1.0, roughness: 0.02, transmission: 0.0, thickness: 0.0,
+        ior: 1.5, iridescence: 0.0, clearcoat: 0.0, clearcoatRoughness: 0.0,
+        specularIntensity: 1.0, envMapIntensity: 1.6,
+        attenuationDistance: Infinity, attenuationColor: 0xffffff,
+    },
+    'Liquid Glass': {
+        metalness: 0.0, roughness: 0.03, transmission: 1.0, thickness: 2.4,
+        ior: 1.45, iridescence: 0.35, clearcoat: 1.0, clearcoatRoughness: 0.02,
+        specularIntensity: 1.0, envMapIntensity: 1.4,
+        attenuationDistance: 6.0, attenuationColor: 0xdfefff,
+    },
+    'Frosted Glass': {
+        metalness: 0.0, roughness: 0.42, transmission: 1.0, thickness: 3.0,
+        ior: 1.35, iridescence: 0.0, clearcoat: 0.35, clearcoatRoughness: 0.35,
+        specularIntensity: 1.0, envMapIntensity: 1.0,
+        attenuationDistance: 4.0, attenuationColor: 0xcfe4ff,
+    },
+    'Matte': {
+        metalness: 0.1, roughness: 0.85, transmission: 0.0, thickness: 0.0,
+        ior: 1.5, iridescence: 0.0, clearcoat: 0.0, clearcoatRoughness: 0.0,
+        specularIntensity: 0.4, envMapIntensity: 0.8,
+        attenuationDistance: Infinity, attenuationColor: 0xffffff,
+    },
+};
+const materialNames = Object.keys(materialPresets);
+let currentMaterialName = materialNames[0];
+
+function applyMaterialPreset(name) {
+    const preset = materialPresets[name];
+    if (!preset) return;
+
+    // transmission and iridescence toggle shader defines, so the program has to
+    // be rebuilt when a preset crosses zero in either direction.
+    const needsRecompile =
+        (phyMat.transmission > 0) !== (preset.transmission > 0) ||
+        (phyMat.iridescence > 0) !== (preset.iridescence > 0);
+
+    phyMat.metalness = preset.metalness;
+    phyMat.roughness = preset.roughness;
+    phyMat.transmission = preset.transmission;
+    phyMat.thickness = preset.thickness;
+    phyMat.ior = preset.ior;
+    phyMat.iridescence = preset.iridescence;
+    phyMat.clearcoat = preset.clearcoat;
+    phyMat.clearcoatRoughness = preset.clearcoatRoughness;
+    phyMat.specularIntensity = preset.specularIntensity;
+    phyMat.envMapIntensity = preset.envMapIntensity;
+    phyMat.attenuationDistance = preset.attenuationDistance;
+    phyMat.attenuationColor.set(preset.attenuationColor);
+
+    if (needsRecompile) phyMat.needsUpdate = true;
+    currentMaterialName = name;
+}
 
 
 const dissolveUniformData = {
@@ -2286,6 +2382,8 @@ let tweaks = {
 
     bloomStrength: unrealBloomPass.strength,
     rotationY: mesh.rotation.y,
+    meshAutoRotate: false,
+    meshRotationSpeed: 0.35,
 };
 
 
@@ -2580,6 +2678,7 @@ function collectSettings() {
         version: 1,
         background: currentBackgroundName,
         mesh: currentMeshName,
+        material: currentMaterialName,
         viewport: { ...viewportSettings },
         camera: { ...cameraSettings },
         audioReactive: { ...audioReactive },
@@ -2605,6 +2704,8 @@ function collectSettings() {
         },
         bloomStrength: tweaks.bloomStrength,
         rotationY: tweaks.rotationY,
+        meshAutoRotate: tweaks.meshAutoRotate,
+        meshRotationSpeed: tweaks.meshRotationSpeed,
     };
 }
 
@@ -2653,6 +2754,9 @@ async function applyImportedSettings(data) {
         tweaks.rotationY = data.rotationY;
         mesh.rotation.y = particleMesh.rotation.y = data.rotationY;
     }
+    if (typeof data.meshAutoRotate === 'boolean') tweaks.meshAutoRotate = data.meshAutoRotate;
+    if (Number.isFinite(data.meshRotationSpeed)) tweaks.meshRotationSpeed = data.meshRotationSpeed;
+    if (data.material && materialPresets[data.material]) applyMaterialPreset(data.material);
     if (data.background && backgroundPresets[data.background]) await loadBackground(data.background);
     if (data.mesh && geoNames.includes(data.mesh)) handleMeshChange(geometries[geoNames.indexOf(data.mesh)], data.mesh);
     fitViewport();
@@ -2766,6 +2870,10 @@ if (!controlsContainer) throw new Error('Controls container was not found.');
 
 let pane = null;
 let meshBlade = null;
+let rotationYBinding = null;
+// Same guard rationale as the seek binding: refreshing a bound value re-emits
+// 'change', and the auto-rotate loop writes rotationY every frame.
+let suppressRotationYChange = false;
 let progressBinding = null;
 let fpsBinding = null;
 const performanceStats = { fps: 0 };
@@ -2903,10 +3011,16 @@ async function initControls() {
             const index = geometries.indexOf(event.value);
             handleMeshChange(event.value, geoNames[index] || currentMeshName);
         });
+        const materialBlade = createTweakList(meshFolder, 'Material', materialNames, materialNames);
+        materialBlade.value = currentMaterialName;
+        materialBlade.on('change', (event) => applyMaterialPreset(event.value));
         meshFolder.addBinding(tweaks, 'bloomStrength', { min: 0, max: 5, step: 0.01, label: 'Bloom Strength' }).on('change', (event) => {
             unrealBloomPass.strength = event.value;
         });
-        meshFolder.addBinding(tweaks, 'rotationY', { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: 'Rotation Y' }).on('change', (event) => {
+        meshFolder.addBinding(tweaks, 'meshAutoRotate', { label: 'Auto Rotate' });
+        meshFolder.addBinding(tweaks, 'meshRotationSpeed', { min: -3, max: 3, step: 0.01, label: 'Rotate Speed' });
+        rotationYBinding = meshFolder.addBinding(tweaks, 'rotationY', { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: 'Rotation Y' }).on('change', (event) => {
+            if (suppressRotationYChange) return;
             particleMesh.rotation.y = mesh.rotation.y = event.value;
         });
 
@@ -2982,6 +3096,24 @@ function animateDissolve() {
 }
 
 
+function animateMeshRotation(delta) {
+    if (!tweaks.meshAutoRotate) return;
+    const speed = Number(tweaks.meshRotationSpeed) || 0;
+    if (speed === 0) return;
+
+    const twoPi = Math.PI * 2;
+    let next = tweaks.rotationY + speed * delta;
+    // The Rotation Y control is bounded to ±2π. Wrapping by a full 4π keeps the
+    // slider inside that range without any visible jump, since +2π and -2π are
+    // the same orientation.
+    if (next > twoPi) next -= twoPi * 2;
+    else if (next < -twoPi) next += twoPi * 2;
+
+    tweaks.rotationY = next;
+    mesh.rotation.y = particleMesh.rotation.y = next;
+}
+
+
 function floatMeshes(time) {
     mesh.position.set(0, Math.sin(time * 2.0) * 0.5, 0);
     particleMesh.position.set(0, Math.sin(time * 2.0) * 0.5, 0);
@@ -2999,6 +3131,7 @@ function animate() {
     previousAnimationTime = animationNow;
 
     animateDissolve();
+    animateMeshRotation(animationDelta);
 
     // Apply the requested frequency mapping without changing the underlying
     // control values: lows scale the mesh, while mids/highs drive bloom and
@@ -3036,6 +3169,7 @@ function animate() {
         refreshSeekBinding();
         const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
         if (timeBinding) timeBinding.refresh();
+        if (tweaks.meshAutoRotate) refreshRotationYBinding();
         lastTransportUiUpdate = animationNow;
     }
 
