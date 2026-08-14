@@ -236,6 +236,7 @@ let audioContext = null;
 let decodeAudioContext = null;
 let audioAnalyser = null;
 let audioSource = null;
+let audioOutputGain = null;
 let audioFrequencyData = null;
 let audioObjectUrl = null;
 
@@ -319,6 +320,13 @@ function getDecodeAudioContext() {
     return decodeAudioContext;
 }
 
+function applyAudioOutputGain() {
+    if (!audioOutputGain || !audioContext) return;
+    const volume = Math.max(0, Math.min(1, Number(audioInfo.volume) / 100));
+    const gain = audioInfo.muted ? 0 : volume;
+    audioOutputGain.gain.setValueAtTime(gain, audioContext.currentTime);
+}
+
 function ensureAudioAnalyser() {
     if (!audioContext) {
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -338,16 +346,31 @@ function ensureAudioAnalyser() {
         audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
     }
 
-    if (!audioSource) {
-        audioSource = audioContext.createMediaElementSource(audioElement);
-        audioSource.connect(audioAnalyser);
-        audioAnalyser.connect(audioContext.destination);
+    // Keep analysis and audible playback on separate branches. The analyser
+    // always receives the unmodified source signal, while volume/mute affect
+    // only the output gain. This prevents transport gain from changing the
+    // visualization and keeps the analyser out of the audible signal path.
+    if (!audioOutputGain) {
+        audioOutputGain = audioContext.createGain();
+        audioOutputGain.connect(audioContext.destination);
     }
 
     if (!recordingDestination) {
         recordingDestination = audioContext.createMediaStreamDestination();
-        audioAnalyser.connect(recordingDestination);
+        audioOutputGain.connect(recordingDestination);
     }
+
+    if (!audioSource) {
+        audioSource = audioContext.createMediaElementSource(audioElement);
+        audioSource.connect(audioAnalyser);
+        audioSource.connect(audioOutputGain);
+    }
+
+    // HTMLMediaElement gain is intentionally kept neutral. User-facing output
+    // level is handled by audioOutputGain after the analysis split.
+    audioElement.volume = 1;
+    audioElement.muted = false;
+    applyAudioOutputGain();
 }
 
 function setAudioResolution(fftSize) {
@@ -492,8 +515,8 @@ async function loadAudioFile(file) {
         if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
         audioObjectUrl = URL.createObjectURL(file);
         audioElement.src = audioObjectUrl;
-        audioElement.volume = Math.max(0, Math.min(1, audioInfo.volume / 100));
-        audioElement.muted = Boolean(audioInfo.muted);
+        audioElement.volume = 1;
+        audioElement.muted = false;
         audioElement.load();
 
         await new Promise((resolve, reject) => {
@@ -1582,24 +1605,33 @@ const galaxyLoopController = (() => {
   function applyAudioLoop(start, end) {
       const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
       if (!(duration > 0)) return;
-      loopSettings.start = clamp(Number(start) || 0, 0, duration);
-      loopSettings.end = clamp(Number(end) || duration, loopSettings.start, duration);
+
+      const nextStart = clamp(Number(start) || 0, 0, duration);
+      const nextEnd = clamp(Number(end) || duration, nextStart + 0.01, duration);
+      loopSettings.start = nextStart;
+      loopSettings.end = nextEnd;
       loopSettings.bpm = clamp(Number(popupBpm) || loopSettings.bpm || 120, 40, 300);
       loopSettings.bars = Math.max(1, Math.round(Number(popupLoopBars) || 1));
       loopSettings.snapToBeats = true;
-      loopSettings.enabled = loopSettings.end > loopSettings.start;
+      loopSettings.enabled = nextEnd > nextStart + 0.005;
+
       updateAudioLoopMode();
-      
-      
-      if (
-          loopSettings.enabled &&
-          (audioElement.currentTime < loopSettings.start || audioElement.currentTime >= loopSettings.end)
-      ) {
+
+      // Applying a loop is a deterministic transport operation: immediately
+      // place the main playback head at the selected start so the next Play
+      // action begins inside the committed region.
+      if (loopSettings.enabled) {
           audioElement.currentTime = loopSettings.start;
+          audioInfo.currentTime = formatTime(loopSettings.start);
+          audioInfo.seekPercent = duration > 0 ? (loopSettings.start / duration) * 100 : 0;
+          audioInfo.status = `Loop applied · ${formatTime(loopSettings.start, true)} – ${formatTime(loopSettings.end, true)}`;
       }
+
       updateMainLoopButton();
       refreshAudioInfo();
-      window.dispatchEvent(new CustomEvent('visualizer-loop-changed'));
+      window.dispatchEvent(new CustomEvent('visualizer-loop-changed', {
+          detail: { start: loopSettings.start, end: loopSettings.end, enabled: loopSettings.enabled }
+      }));
   }
 
   function clearAudioLoop() {
@@ -1842,6 +1874,9 @@ const dissolveUniformData = {
     },
     uMotionOffset: {
         value: new THREE.Vector3(0, 0, 0)
+    },
+    uEdgeBloomBoost: {
+        value: 1.0
     }
 }
 
@@ -1875,6 +1910,7 @@ function setupDissolveShader(shader) {
         uniform float uMotionAngle;
         uniform vec3 uMotionOffset;
         uniform vec3 uEdgeColor;
+        uniform float uEdgeBloomBoost;
 
         ${snoise}
     `);
@@ -1909,7 +1945,7 @@ function setupDissolveShader(shader) {
         float edgeWidth = uProgress + uEdge;
 
         if(noise > uProgress && noise < edgeWidth){
-            gl_FragColor = vec4(vec3(uEdgeColor),noise); // colors the edge
+            gl_FragColor = vec4(vec3(uEdgeColor) * uEdgeBloomBoost, noise); // colors the edge and feeds reactive bloom
         }else{
             gl_FragColor = vec4(gl_FragColor.xyz,1.0);
         }
@@ -2706,11 +2742,11 @@ async function initControls() {
             const duration = audioElement.duration || 0;
             if (duration > 0) audioElement.currentTime = duration * (event.value / 100);
         });
-        audioFolder.addBinding(audioInfo, 'volume', { min: 0, max: 100, step: 1, label: 'Volume' }).on('change', (event) => {
-            audioElement.volume = event.value / 100;
+        audioFolder.addBinding(audioInfo, 'volume', { min: 0, max: 100, step: 1, label: 'Volume' }).on('change', () => {
+            applyAudioOutputGain();
         });
-        audioFolder.addBinding(audioInfo, 'muted', { label: 'Mute' }).on('change', (event) => {
-            audioElement.muted = event.value;
+        audioFolder.addBinding(audioInfo, 'muted', { label: 'Mute' }).on('change', () => {
+            applyAudioOutputGain();
         });
 
         loopButtonController = audioFolder.addButton({ title: 'Loop' });
@@ -2915,7 +2951,11 @@ function animate() {
     particleMesh.scale.setScalar(meshScale);
 
     const midHighMagnitude = Math.min(1, audio.mids * 0.55 + audio.highs * 0.65);
-    unrealBloomPass.strength = baseBloomStrength + midHighMagnitude * audioReactive.bloomResponse;
+    const reactiveBloomAmount = midHighMagnitude * audioReactive.bloomResponse;
+    unrealBloomPass.strength = baseBloomStrength + reactiveBloomAmount;
+    // Feed the same reactive bloom amount into the emissive dissolve edge so
+    // the edge itself becomes a stronger bloom source as mids/highs rise.
+    dissolveUniformData.uEdgeBloomBoost.value = 1 + reactiveBloomAmount;
     particlesUniformData.uBaseSize.value = baseParticleSize * (1 + midHighMagnitude * audioReactive.particleSizeResponse);
 
     updateCameraMotion(time, audio);
@@ -2945,6 +2985,7 @@ function animate() {
     // Restore baseline values so audio reactivity never rewrites user controls.
     particlesUniformData.uBaseSize.value = baseParticleSize;
     unrealBloomPass.strength = baseBloomStrength;
+    dissolveUniformData.uEdgeBloomBoost.value = 1;
 
     fpsFrameCount++;
     const now = performance.now();
