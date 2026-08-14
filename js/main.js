@@ -223,9 +223,6 @@ function failLoadProgress(kind, label) {
 
 // Audio-reactive layer. The selected file stays local to the browser and is
 // analysed with the Web Audio API; the original visual effect remains intact.
-const audioElement = new Audio();
-audioElement.preload = 'auto';
-
 const audioFileInput = document.createElement('input');
 audioFileInput.type = 'file';
 audioFileInput.accept = 'audio/*';
@@ -235,10 +232,13 @@ document.body.appendChild(audioFileInput);
 let audioContext = null;
 let decodeAudioContext = null;
 let audioAnalyser = null;
-let audioSource = null;
 let audioOutputGain = null;
 let audioFrequencyData = null;
-let audioObjectUrl = null;
+let transportSource = null;
+let transportIsPlaying = false;
+let transportOffset = 0;
+let transportStartedAt = 0;
+let transportStartedOffset = 0;
 
 const audioReactive = {
     sensitivity: 1.35,
@@ -346,10 +346,6 @@ function ensureAudioAnalyser() {
         audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
     }
 
-    // Keep analysis and audible playback on separate branches. The analyser
-    // always receives the unmodified source signal, while volume/mute affect
-    // only the output gain. This prevents transport gain from changing the
-    // visualization and keeps the analyser out of the audible signal path.
     if (!audioOutputGain) {
         audioOutputGain = audioContext.createGain();
         audioOutputGain.connect(audioContext.destination);
@@ -360,17 +356,133 @@ function ensureAudioAnalyser() {
         audioOutputGain.connect(recordingDestination);
     }
 
-    if (!audioSource) {
-        audioSource = audioContext.createMediaElementSource(audioElement);
-        audioSource.connect(audioAnalyser);
-        audioSource.connect(audioOutputGain);
+    applyAudioOutputGain();
+}
+
+function getTransportDuration() {
+    return decodedAudioBuffer?.duration || 0;
+}
+
+function getTransportTime() {
+    const duration = getTransportDuration();
+    if (!(duration > 0)) return 0;
+    if (!transportIsPlaying || !audioContext) {
+        return clamp(transportOffset, 0, duration);
     }
 
-    // HTMLMediaElement gain is intentionally kept neutral. User-facing output
-    // level is handled by audioOutputGain after the analysis split.
-    audioElement.volume = 1;
-    audioElement.muted = false;
-    applyAudioOutputGain();
+    let time = transportStartedOffset + Math.max(0, audioContext.currentTime - transportStartedAt);
+    if (loopSettings.enabled && loopSettings.end > loopSettings.start) {
+        const start = clamp(loopSettings.start, 0, duration);
+        const end = clamp(loopSettings.end, start, duration);
+        const loopDuration = end - start;
+        if (loopDuration > 0 && time >= end) {
+            time = start + ((time - start) % loopDuration + loopDuration) % loopDuration;
+        }
+    }
+    return clamp(time, 0, duration);
+}
+
+function stopTransportSource() {
+    if (!transportSource) return;
+    transportSource.onended = null;
+    try { transportSource.stop(); } catch (_) {}
+    try { transportSource.disconnect(); } catch (_) {}
+    transportSource = null;
+}
+
+function configureTransportLoop(source) {
+    if (!source) return;
+    const duration = getTransportDuration();
+    const start = clamp(loopSettings.start, 0, duration);
+    const end = clamp(loopSettings.end || duration, start, duration);
+    source.loop = Boolean(loopSettings.enabled && end > start + 0.005);
+    if (source.loop) {
+        source.loopStart = start;
+        source.loopEnd = end;
+    }
+}
+
+function startTransportAt(seconds) {
+    if (!decodedAudioBuffer) return false;
+    ensureAudioAnalyser();
+
+    const duration = getTransportDuration();
+    let offset = clamp(Number(seconds) || 0, 0, Math.max(0, duration - 1e-6));
+    if (loopSettings.enabled && loopSettings.end > loopSettings.start) {
+        const start = clamp(loopSettings.start, 0, duration);
+        const end = clamp(loopSettings.end, start, duration);
+        if (offset < start || offset >= end) offset = start;
+    }
+
+    stopTransportSource();
+    const source = audioContext.createBufferSource();
+    source.buffer = decodedAudioBuffer;
+    source.connect(audioAnalyser);
+    source.connect(audioOutputGain);
+    configureTransportLoop(source);
+
+    transportSource = source;
+    transportStartedOffset = offset;
+    transportStartedAt = audioContext.currentTime;
+    transportOffset = offset;
+    transportIsPlaying = true;
+
+    source.onended = () => {
+        if (transportSource !== source) return;
+        transportSource = null;
+        if (source.loop) return;
+        transportIsPlaying = false;
+        transportOffset = duration;
+        audioInfo.currentTime = formatTime(duration);
+        audioInfo.seekPercent = 100;
+        audioInfo.status = 'Ended';
+        refreshAudioInfo();
+    };
+
+    source.start(0, offset);
+    return true;
+}
+
+async function playTransport() {
+    if (!decodedAudioBuffer) return false;
+    ensureAudioAnalyser();
+    if (audioContext.state === 'suspended') await audioContext.resume();
+
+    const duration = getTransportDuration();
+    if (transportOffset >= duration - 1e-4) transportOffset = 0;
+    if (loopSettings.enabled && loopSettings.end > loopSettings.start) {
+        if (transportOffset < loopSettings.start || transportOffset >= loopSettings.end) {
+            transportOffset = loopSettings.start;
+        }
+    }
+
+    const started = startTransportAt(transportOffset);
+    if (started) {
+        audioInfo.status = 'Playing';
+        refreshAudioInfo();
+    }
+    return started;
+}
+
+function pauseTransport() {
+    if (!transportIsPlaying) return;
+    transportOffset = getTransportTime();
+    transportIsPlaying = false;
+    stopTransportSource();
+    if (audioInfo.status !== 'Loading audio…') audioInfo.status = 'Paused';
+    refreshAudioInfo();
+}
+
+function seekTransport(seconds) {
+    const duration = getTransportDuration();
+    if (!(duration > 0)) return;
+    const wasPlaying = transportIsPlaying;
+    const next = clamp(Number(seconds) || 0, 0, duration);
+    transportOffset = next;
+    if (wasPlaying) startTransportAt(next);
+    audioInfo.currentTime = formatTime(next);
+    audioInfo.seekPercent = (next / duration) * 100;
+    refreshAudioInfo();
 }
 
 function setAudioResolution(fftSize) {
@@ -396,7 +508,7 @@ function getBandLevel(minHz, maxHz) {
 }
 
 function readAudioLevels() {
-    if (!audioAnalyser || !audioFrequencyData || audioElement.paused) {
+    if (!audioAnalyser || !audioFrequencyData || !transportIsPlaying) {
         return { bass: 0, mids: 0, highs: 0, level: 0 };
     }
 
@@ -420,7 +532,7 @@ function readAudioLevels() {
 }
 
 function getSpectralCentroid() {
-    if (!audioAnalyser || !audioFrequencyData || !audioContext || audioElement.paused) return 0.5;
+    if (!audioAnalyser || !audioFrequencyData || !audioContext || !transportIsPlaying) return 0.5;
     let weighted = 0;
     let total = 0;
     for (let i = 0; i < audioFrequencyData.length; i++) {
@@ -433,36 +545,31 @@ function getSpectralCentroid() {
 }
 
 async function toggleAudioPlayback() {
-    if (!audioElement.src) {
+    if (!decodedAudioBuffer) {
         audioFileInput.click();
         return;
     }
 
-    ensureAudioAnalyser();
-    if (audioContext?.state === 'suspended') await audioContext.resume();
-
-    if (audioElement.paused) {
-        const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
-        if (loopSettings.enabled && duration > 0) {
-            const start = Math.max(0, Math.min(duration, loopSettings.start));
-            const end = Math.max(start + 0.01, Math.min(duration, loopSettings.end || duration));
-            if (audioElement.currentTime < start || audioElement.currentTime >= end) {
-                audioElement.currentTime = start;
-            }
+    try {
+        if (transportIsPlaying) {
+            pauseTransport();
+        } else {
+            await playTransport();
         }
-        await audioElement.play();
-        audioInfo.status = 'Playing';
-    } else {
-        audioElement.pause();
-        audioInfo.status = 'Paused';
+    } catch (error) {
+        console.error('Audio playback failed:', error);
+        transportIsPlaying = false;
+        audioInfo.status = 'Playback failed';
+        refreshAudioInfo();
     }
-    refreshAudioInfo();
 }
 
 async function loadAudioFile(file) {
     if (!file) return;
 
-    audioElement.pause();
+    pauseTransport();
+    stopTransportSource();
+    transportOffset = 0;
     audioInfo.status = 'Loading audio…';
     refreshAudioInfo();
 
@@ -507,40 +614,19 @@ async function loadAudioFile(file) {
             loopSettings.start = 0;
             loopSettings.end = decodedAudioBuffer.duration;
         } catch (decodeError) {
-            console.warn('Audio metadata decode failed; playback can still continue.', decodeError);
+            console.error('Audio decode failed.', decodeError);
             decodedAudioBuffer = null;
-            audioInfo.decode = 'Playback only';
+            audioInfo.decode = 'Failed';
+            throw new Error('The selected audio file could not be decoded for playback.');
         }
 
-        if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
-        audioObjectUrl = URL.createObjectURL(file);
-        audioElement.src = audioObjectUrl;
-        audioElement.volume = 1;
-        audioElement.muted = false;
-        audioElement.load();
-
-        await new Promise((resolve, reject) => {
-            const timeout = window.setTimeout(() => reject(new Error('Audio load timeout.')), 15000);
-            const onReady = () => {
-                window.clearTimeout(timeout);
-                audioElement.removeEventListener('error', onError);
-                resolve();
-            };
-            const onError = () => {
-                window.clearTimeout(timeout);
-                audioElement.removeEventListener('loadedmetadata', onReady);
-                reject(new Error('The selected audio file could not be loaded.'));
-            };
-            audioElement.addEventListener('loadedmetadata', onReady, { once: true });
-            audioElement.addEventListener('error', onError, { once: true });
-        });
-
-        const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
+        const duration = decodedAudioBuffer?.duration || 0;
         if (duration > 0) {
             loopSettings.start = 0;
             loopSettings.end = duration;
             audioInfo.duration = formatTime(duration, true);
         }
+        transportOffset = 0;
         updateAudioLoopMode();
         audioInfo.status = 'Ready';
         completeLoadProgress('audio', progressLabel);
@@ -577,22 +663,13 @@ window.addEventListener('drop', (event) => {
 
 
 function updateAudioLoopMode() {
-    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
-    const fullTrack = duration > 0 && loopSettings.start <= 0.001 && loopSettings.end >= duration - 0.001;
-    audioElement.loop = Boolean(loopSettings.enabled && fullTrack);
+    if (transportSource) configureTransportLoop(transportSource);
 }
 
 function enforceAudioLoopRange() {
-    if (!loopSettings.enabled || audioElement.paused) return;
-    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
-    if (!(duration > 0)) return;
-    const start = Math.max(0, Math.min(duration, loopSettings.start));
-    const end = Math.max(start + 0.01, Math.min(duration, loopSettings.end || duration));
-    const partial = start > 0.001 || end < duration - 0.001;
-    if (!partial) return;
-    if (audioElement.currentTime >= end - 0.005 || audioElement.currentTime < start - 0.05) {
-        audioElement.currentTime = start;
-    }
+    // AudioBufferSourceNode handles the applied loop natively at audio-clock
+    // precision. Avoid repeatedly assigning currentTime on an HTMLMediaElement;
+    // those decoder seeks were the source of loop gaps, clicks and stuttering.
 }
 
 function snapLoopTime(seconds) {
@@ -602,7 +679,7 @@ function snapLoopTime(seconds) {
 }
 
 function applyLoopBars() {
-    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
+    const duration = getTransportDuration();
     if (!duration) return;
     loopSettings.start = Math.max(0, Math.min(duration, snapLoopTime(loopSettings.start)));
     const barSeconds = (60 / Math.max(1, loopSettings.bpm)) * 4;
@@ -612,7 +689,7 @@ function applyLoopBars() {
 }
 
 function setFullTrackLoop() {
-    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
+    const duration = getTransportDuration();
     if (!duration) return;
     loopSettings.start = 0;
     loopSettings.end = duration;
@@ -735,7 +812,7 @@ const galaxyLoopController = (() => {
 
   // ── Entry point ──
   function openLoopPopup() {
-      if (popupOpen || !Boolean(decodedAudioBuffer && audioElement.src) || !decodedAudioBuffer) return;
+      if (popupOpen || !decodedAudioBuffer) return;
       popupOpen = true;
       popupIsPlaying = false;
       popupSource = null;
@@ -744,9 +821,7 @@ const galaxyLoopController = (() => {
       popupBpm = clamp(loopSettings.bpm || 120, 40, 300);
       popupLoopBars = Math.max(1, Math.round(loopSettings.bars || 4));
 
-      if (audioElement) {
-          try { audioElement.pause(); } catch (_) {}
-      }
+      pauseTransport();
       const mainPlayBtn = document.getElementById('play-btn');
       if (mainPlayBtn) {
           mainPlayBtn.textContent = '▶ Play';
@@ -1603,7 +1678,7 @@ const galaxyLoopController = (() => {
   }
 
   function applyAudioLoop(start, end) {
-      const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
+      const duration = getTransportDuration();
       if (!(duration > 0)) return;
 
       const nextStart = clamp(Number(start) || 0, 0, duration);
@@ -1621,9 +1696,7 @@ const galaxyLoopController = (() => {
       // place the main playback head at the selected start so the next Play
       // action begins inside the committed region.
       if (loopSettings.enabled) {
-          audioElement.currentTime = loopSettings.start;
-          audioInfo.currentTime = formatTime(loopSettings.start);
-          audioInfo.seekPercent = duration > 0 ? (loopSettings.start / duration) * 100 : 0;
+          seekTransport(loopSettings.start);
           audioInfo.status = `Loop applied · ${formatTime(loopSettings.start, true)} – ${formatTime(loopSettings.end, true)}`;
       }
 
@@ -1635,7 +1708,7 @@ const galaxyLoopController = (() => {
   }
 
   function clearAudioLoop() {
-      const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
+      const duration = getTransportDuration();
       loopSettings.enabled = false;
       loopSettings.start = 0;
       loopSettings.end = duration;
@@ -1649,36 +1722,6 @@ const galaxyLoopController = (() => {
   return { open: openLoopPopup, close: closePopup, syncButton: updateMainLoopButton };
 })();
 
-
-audioElement.addEventListener('loadedmetadata', () => {
-    if (Number.isFinite(audioElement.duration)) {
-        audioInfo.duration = formatTime(audioElement.duration, true);
-        if (!loopSettings.end) loopSettings.end = audioElement.duration;
-    }
-    refreshAudioInfo();
-});
-
-audioElement.addEventListener('timeupdate', () => {
-    const duration = audioElement.duration || 0;
-    audioInfo.currentTime = formatTime(audioElement.currentTime);
-    audioInfo.seekPercent = duration > 0 ? (audioElement.currentTime / duration) * 100 : 0;
-    refreshAudioInfo();
-});
-
-audioElement.addEventListener('play', () => {
-    audioInfo.status = 'Playing';
-    refreshAudioInfo();
-});
-audioElement.addEventListener('pause', () => {
-    if (!audioElement.ended && audioInfo.status !== 'Loading audio…') {
-        audioInfo.status = 'Paused';
-        refreshAudioInfo();
-    }
-});
-audioElement.addEventListener('ended', () => {
-    audioInfo.status = 'Ended';
-    refreshAudioInfo();
-});
 
 
 
@@ -2615,7 +2658,7 @@ async function startVideoExport() {
         stopVideoExport();
         return;
     }
-    if (!audioElement.src) {
+    if (!decodedAudioBuffer) {
         exportSettings.status = 'Load audio before video export';
         pane.refresh();
         return;
@@ -2663,18 +2706,18 @@ async function startVideoExport() {
         pane.refresh();
     });
 
-    const duration = audioElement.duration || 0;
+    const duration = getTransportDuration();
     const useLoopRange = loopSettings.enabled && duration > 0;
     const start = useLoopRange ? Math.max(0, loopSettings.start) : 0;
     const end = useLoopRange ? Math.min(duration, loopSettings.end || duration) : duration;
     exportPreviousLoop = loopSettings.enabled;
     loopSettings.enabled = false;
     updateAudioLoopMode();
-    audioElement.currentTime = start;
+    seekTransport(start);
     exportStopAt = end;
     exportSettings.status = 'Exporting video…';
     mediaRecorder.start(500);
-    await audioElement.play();
+    await playTransport();
     pane.refresh();
 }
 
@@ -2739,8 +2782,8 @@ async function initControls() {
             audioFolder.addBinding(audioInfo, 'currentTime', { label: 'Time', readonly: true }),
         ];
         seekBinding = audioFolder.addBinding(audioInfo, 'seekPercent', { min: 0, max: 100, step: 0.1, label: 'Seek %' }).on('change', (event) => {
-            const duration = audioElement.duration || 0;
-            if (duration > 0) audioElement.currentTime = duration * (event.value / 100);
+            const duration = getTransportDuration();
+            if (duration > 0) seekTransport(duration * (event.value / 100));
         });
         audioFolder.addBinding(audioInfo, 'volume', { min: 0, max: 100, step: 1, label: 'Volume' }).on('change', () => {
             applyAudioOutputGain();
@@ -2910,6 +2953,7 @@ function floatMeshes(time) {
 const clock = new THREE.Clock();
 let dissolveMotionPhase = 0;
 let previousAnimationTime = performance.now();
+let lastTransportUiUpdate = 0;
 function animate() {
     let time = clock.getElapsedTime();
     const animationNow = performance.now();
@@ -2946,6 +2990,17 @@ function animate() {
 
     enforceAudioLoopRange();
 
+    if (animationNow - lastTransportUiUpdate >= 200) {
+        const duration = getTransportDuration();
+        const currentTime = getTransportTime();
+        audioInfo.currentTime = formatTime(currentTime);
+        audioInfo.seekPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
+        if (seekBinding) seekBinding.refresh();
+        const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
+        if (timeBinding) timeBinding.refresh();
+        lastTransportUiUpdate = animationNow;
+    }
+
     const meshScale = 1 + audio.bass * audioReactive.lowMeshSizeResponse;
     mesh.scale.setScalar(meshScale);
     particleMesh.scale.setScalar(meshScale);
@@ -2977,8 +3032,8 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
-    if (mediaRecorder?.state === 'recording' && exportStopAt != null && audioElement.currentTime >= exportStopAt - 0.02) {
-        audioElement.pause();
+    if (mediaRecorder?.state === 'recording' && exportStopAt != null && getTransportTime() >= exportStopAt - 0.02) {
+        pauseTransport();
         stopVideoExport();
     }
 
