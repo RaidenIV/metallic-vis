@@ -98,3 +98,27 @@ body {
   background: #fff;
   transition: width 120ms linear;
 }
+
+.control-panel--error {
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(0, 0, 0, 0.88);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* Added controls can exceed the viewport height; keep the panel usable without
+   changing the canvas or existing visual styling. */
+.control-panel {
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+#c.viewport-framed {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}

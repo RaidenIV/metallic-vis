@@ -6,7 +6,6 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
-import { Pane } from 'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -249,11 +248,64 @@ const audioReactive = {
     highsMinHz: 2200,
     highsMaxHz: 12000,
     lowMeshSizeResponse: 0.45,
-    midsBloomResponse: 1.2,
-    highsBloomResponse: 1.8,
-    midsParticleSizeResponse: 1.0,
-    highsParticleSizeResponse: 1.5,
+    bloomResponse: 1.5,
+    particleSizeResponse: 1.25,
 };
+
+const audioSettings = {
+    fftSize: 1024,
+};
+
+const audioInfo = {
+    name: 'No file loaded',
+    type: 'Unavailable',
+    size: 'Unavailable',
+    duration: 'Unavailable',
+    sampleRate: 'Unavailable',
+    channels: 'Unavailable',
+    decode: 'Not loaded',
+    status: 'Choose or drop a supported audio file.',
+    currentTime: '0:00',
+    seekPercent: 0,
+    volume: 100,
+    muted: false,
+};
+
+const loopSettings = {
+    enabled: false,
+    start: 0,
+    end: 0,
+    bpm: 120,
+    bars: 4,
+    snapToBeats: true,
+};
+
+let decodedAudioBuffer = null;
+let recordingDestination = null;
+let audioInfoBindings = [];
+let seekBinding = null;
+let loopBindings = [];
+
+function formatTime(seconds, precise = false) {
+    const value = Math.max(0, Number(seconds) || 0);
+    const minutes = Math.floor(value / 60);
+    const secs = value - minutes * 60;
+    if (precise) return `${minutes}:${secs.toFixed(3).padStart(6, '0')}`;
+    return `${minutes}:${Math.floor(secs).toString().padStart(2, '0')}`;
+}
+
+function formatBytes(bytes) {
+    const value = Number(bytes) || 0;
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function refreshAudioInfo() {
+    audioInfoBindings.forEach((binding) => binding.refresh());
+    if (seekBinding) seekBinding.refresh();
+    loopBindings.forEach((binding) => binding.refresh());
+}
 
 function ensureAudioAnalyser() {
     if (!audioContext) {
@@ -262,8 +314,13 @@ function ensureAudioAnalyser() {
 
     if (!audioAnalyser) {
         audioAnalyser = audioContext.createAnalyser();
-        audioAnalyser.fftSize = 1024;
         audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
+    }
+
+    if (audioAnalyser.fftSize !== audioSettings.fftSize) {
+        audioAnalyser.fftSize = audioSettings.fftSize;
+    }
+    if (!audioFrequencyData || audioFrequencyData.length !== audioAnalyser.frequencyBinCount) {
         audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
     }
 
@@ -272,6 +329,20 @@ function ensureAudioAnalyser() {
         audioSource.connect(audioAnalyser);
         audioAnalyser.connect(audioContext.destination);
     }
+
+    if (!recordingDestination) {
+        recordingDestination = audioContext.createMediaStreamDestination();
+        audioAnalyser.connect(recordingDestination);
+    }
+}
+
+function setAudioResolution(fftSize) {
+    const next = Number(fftSize);
+    if (![256, 512, 1024, 2048, 4096, 8192, 16384].includes(next)) return;
+    audioSettings.fftSize = next;
+    ensureAudioAnalyser();
+    audioAnalyser.fftSize = next;
+    audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
 }
 
 function getBandLevel(minHz, maxHz) {
@@ -311,6 +382,19 @@ function readAudioLevels() {
     return { bass, mids, highs, level };
 }
 
+function getSpectralCentroid() {
+    if (!audioAnalyser || !audioFrequencyData || !audioContext || audioElement.paused) return 0.5;
+    let weighted = 0;
+    let total = 0;
+    for (let i = 0; i < audioFrequencyData.length; i++) {
+        const magnitude = audioFrequencyData[i] / 255;
+        weighted += i * magnitude;
+        total += magnitude;
+    }
+    if (total <= 1e-6) return 0.5;
+    return Math.max(0, Math.min(1, (weighted / total) / Math.max(1, audioFrequencyData.length - 1)));
+}
+
 async function toggleAudioPlayback() {
     if (!audioElement.src) {
         audioFileInput.click();
@@ -320,49 +404,229 @@ async function toggleAudioPlayback() {
     ensureAudioAnalyser();
     if (audioContext?.state === 'suspended') await audioContext.resume();
 
-    if (audioElement.paused) await audioElement.play();
-    else audioElement.pause();
+    if (audioElement.paused) {
+        await audioElement.play();
+        audioInfo.status = 'Playing';
+    } else {
+        audioElement.pause();
+        audioInfo.status = 'Paused';
+    }
+    refreshAudioInfo();
 }
 
-audioFileInput.addEventListener('change', async () => {
-    const file = audioFileInput.files?.[0];
+async function loadAudioFile(file) {
     if (!file) return;
 
     const progressLabel = `Audio · ${file.name}`;
     updateLoadProgress('audio', 0, progressLabel);
+    audioInfo.name = file.name;
+    audioInfo.type = file.type || 'Unknown';
+    audioInfo.size = formatBytes(file.size);
+    audioInfo.decode = 'Loading…';
+    audioInfo.status = 'Loading audio…';
+    refreshAudioInfo();
 
     try {
-        // Read the local file once so the progress bar reflects actual bytes read.
-        // Playback still uses a local object URL and nothing is uploaded.
-        await new Promise((resolve, reject) => {
+        const arrayBuffer = await new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.addEventListener('progress', (event) => {
                 if (event.lengthComputable && event.total > 0) {
                     updateLoadProgress('audio', event.loaded / event.total, progressLabel);
                 }
             });
-            reader.addEventListener('load', resolve, { once: true });
+            reader.addEventListener('load', () => resolve(reader.result), { once: true });
             reader.addEventListener('error', () => reject(reader.error || new Error('Audio file read failed.')), { once: true });
             reader.addEventListener('abort', () => reject(new Error('Audio file read was cancelled.')), { once: true });
             reader.readAsArrayBuffer(file);
         });
 
+        ensureAudioAnalyser();
+        if (audioContext?.state === 'suspended') await audioContext.resume();
+
+        try {
+            decodedAudioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+            audioInfo.duration = formatTime(decodedAudioBuffer.duration, true);
+            audioInfo.sampleRate = `${decodedAudioBuffer.sampleRate.toLocaleString()} Hz`;
+            audioInfo.channels = String(decodedAudioBuffer.numberOfChannels);
+            audioInfo.decode = 'Ready';
+            loopSettings.start = 0;
+            loopSettings.end = decodedAudioBuffer.duration;
+        } catch (decodeError) {
+            console.warn('Audio metadata decode failed; playback can still continue.', decodeError);
+            decodedAudioBuffer = null;
+            audioInfo.decode = 'Playback only';
+        }
+
         if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
         audioObjectUrl = URL.createObjectURL(file);
         audioElement.src = audioObjectUrl;
         audioElement.load();
-
-        ensureAudioAnalyser();
-        if (audioContext?.state === 'suspended') await audioContext.resume();
+        audioInfo.seekPercent = 0;
+        audioInfo.status = 'Ready';
         completeLoadProgress('audio', progressLabel);
+        refreshAudioInfo();
         await audioElement.play();
+        audioInfo.status = 'Playing';
+        refreshAudioInfo();
     } catch (error) {
         console.error(error);
+        audioInfo.decode = 'Failed';
+        audioInfo.status = 'Audio load failed';
+        refreshAudioInfo();
         failLoadProgress('audio', 'Audio load failed');
-    } finally {
-        audioFileInput.value = '';
+    }
+}
+
+audioFileInput.addEventListener('change', async () => {
+    const file = audioFileInput.files?.[0];
+    await loadAudioFile(file);
+    audioFileInput.value = '';
+});
+
+window.addEventListener('dragover', (event) => {
+    if ([...event.dataTransfer.types].includes('Files')) event.preventDefault();
+});
+window.addEventListener('drop', (event) => {
+    const file = event.dataTransfer?.files?.[0];
+    if (!file) return;
+    event.preventDefault();
+    if (file.type.startsWith('audio/') || /\.(wav|mp3|m4a|aac|ogg|flac)$/i.test(file.name)) {
+        void loadAudioFile(file);
     }
 });
+
+
+function updateAudioLoopMode() {
+    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
+    const fullTrack = duration > 0 && loopSettings.start <= 0.001 && loopSettings.end >= duration - 0.001;
+    audioElement.loop = Boolean(loopSettings.enabled && fullTrack);
+}
+
+function snapLoopTime(seconds) {
+    if (!loopSettings.snapToBeats) return seconds;
+    const beat = 60 / Math.max(1, loopSettings.bpm);
+    return Math.round(seconds / beat) * beat;
+}
+
+function applyLoopBars() {
+    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
+    if (!duration) return;
+    loopSettings.start = Math.max(0, Math.min(duration, snapLoopTime(loopSettings.start)));
+    const barSeconds = (60 / Math.max(1, loopSettings.bpm)) * 4;
+    loopSettings.end = Math.min(duration, loopSettings.start + Math.max(1, loopSettings.bars) * barSeconds);
+    updateAudioLoopMode();
+    refreshAudioInfo();
+}
+
+function setFullTrackLoop() {
+    const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
+    if (!duration) return;
+    loopSettings.start = 0;
+    loopSettings.end = duration;
+    updateAudioLoopMode();
+    refreshAudioInfo();
+}
+
+async function detectLoopBpm() {
+    if (!decodedAudioBuffer) return null;
+    const OfflineContext = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OfflineContext) return null;
+
+    const sampleRate = decodedAudioBuffer.sampleRate;
+    const maxLength = Math.min(decodedAudioBuffer.length, sampleRate * 90);
+    const mono = new Float32Array(maxLength);
+    for (let channelIndex = 0; channelIndex < decodedAudioBuffer.numberOfChannels; channelIndex++) {
+        const channel = decodedAudioBuffer.getChannelData(channelIndex);
+        for (let i = 0; i < maxLength; i++) mono[i] += channel[i];
+    }
+    if (decodedAudioBuffer.numberOfChannels > 1) {
+        const mixScale = 1 / decodedAudioBuffer.numberOfChannels;
+        for (let i = 0; i < maxLength; i++) mono[i] *= mixScale;
+    }
+
+    const offline = new OfflineContext(1, maxLength, sampleRate);
+    const buffer = offline.createBuffer(1, maxLength, sampleRate);
+    buffer.getChannelData(0).set(mono);
+    const source = offline.createBufferSource();
+    source.buffer = buffer;
+    const lowPass = offline.createBiquadFilter();
+    lowPass.type = 'lowpass';
+    lowPass.frequency.value = 180;
+    source.connect(lowPass);
+    lowPass.connect(offline.destination);
+    source.start();
+    const rendered = await offline.startRendering();
+    const filtered = rendered.getChannelData(0);
+
+    const hop = 512;
+    const frames = Math.floor(filtered.length / hop);
+    if (frames < 8) return null;
+    const energy = new Float32Array(frames);
+    let maxEnergy = 0;
+    for (let frame = 0; frame < frames; frame++) {
+        let sum = 0;
+        const offset = frame * hop;
+        for (let i = 0; i < hop; i++) {
+            const sample = filtered[offset + i];
+            sum += sample * sample;
+        }
+        energy[frame] = sum;
+        maxEnergy = Math.max(maxEnergy, sum);
+    }
+    if (maxEnergy <= 0) return null;
+    for (let i = 0; i < energy.length; i++) energy[i] /= maxEnergy;
+
+    const fps = sampleRate / hop;
+    const minLag = Math.max(2, Math.floor(fps * 60 / 200));
+    const maxLag = Math.min(frames - 1, Math.ceil(fps * 60 / 60));
+    let bestLag = minLag;
+    let best = -Infinity;
+    for (let lag = minLag; lag <= maxLag; lag++) {
+        let corr = 0;
+        for (let i = 0; i < frames - lag; i++) corr += energy[i] * energy[i + lag];
+        if (corr > best) {
+            best = corr;
+            bestLag = lag;
+        }
+    }
+    let bpm = Math.round((60 * fps) / bestLag);
+    while (bpm < 70) bpm *= 2;
+    while (bpm > 180) bpm = Math.round(bpm / 2);
+    return bpm;
+}
+
+audioElement.addEventListener('loadedmetadata', () => {
+    if (Number.isFinite(audioElement.duration)) {
+        audioInfo.duration = formatTime(audioElement.duration, true);
+        if (!loopSettings.end) loopSettings.end = audioElement.duration;
+    }
+    refreshAudioInfo();
+});
+
+audioElement.addEventListener('timeupdate', () => {
+    const duration = audioElement.duration || 0;
+    audioInfo.currentTime = formatTime(audioElement.currentTime);
+    audioInfo.seekPercent = duration > 0 ? (audioElement.currentTime / duration) * 100 : 0;
+
+    if (loopSettings.enabled && duration > 0) {
+        const start = Math.max(0, Math.min(duration, loopSettings.start));
+        const end = Math.max(start + 0.01, Math.min(duration, loopSettings.end || duration));
+        const partial = start > 0.001 || end < duration - 0.001;
+        if (partial && audioElement.currentTime >= end - 0.02) {
+            audioElement.currentTime = start;
+            if (!audioElement.paused) void audioElement.play();
+        }
+    }
+    refreshAudioInfo();
+});
+
+audioElement.addEventListener('ended', () => {
+    if (loopSettings.enabled) {
+        audioElement.currentTime = Math.max(0, loopSettings.start);
+        void audioElement.play();
+    }
+});
+
 
 
 const cubeRenderTarget = new THREE.WebGLCubeRenderTarget(256);
@@ -445,6 +709,7 @@ async function loadBackground(name) {
         }
 
         activeBackgroundTexture = texture;
+        currentBackgroundName = name;
         scene.background = texture;
         if (preset.type === 'cube') {
             cubeTexture = texture;
@@ -816,8 +1081,8 @@ scene.add(particleMesh);
 
 
 function resizeRendererToDisplaySize() {
-    const width = cnvs.clientWidth * scale;
-    const height = cnvs.clientHeight * scale;
+    const width = exportOverrideSize ? exportOverrideSize.width : cnvs.clientWidth * scale;
+    const height = exportOverrideSize ? exportOverrideSize.height : cnvs.clientHeight * scale;
     const needResize = cnvs.width !== width || cnvs.height !== height;
     if (needResize) {
         re.setSize(width, height, false);
@@ -875,7 +1140,10 @@ function createTweakList(container, name, keys, vals) {
 }
 
 
-function handleMeshChange(geo) {
+let currentMeshName = geoNames[0];
+let currentBackgroundName = 'Original';
+
+function handleMeshChange(geo, name = null) {
     scene.remove(mesh);
     scene.remove(particleMesh);
 
@@ -884,79 +1152,664 @@ function handleMeshChange(geo) {
 
     initParticleAttributes(geo);
     particleMesh = new THREE.Points(geo, particleMat);
+    mesh.visible = tweaks?.meshVisible ?? true;
+    particleMesh.visible = tweaks?.particleVisible ?? true;
+    if (tweaks) {
+        mesh.rotation.y = particleMesh.rotation.y = tweaks.rotationY;
+    }
 
     scene.add(mesh);
     scene.add(particleMesh);
+    if (name) currentMeshName = name;
 }
 
+
+
+const viewportSettings = {
+    format: 'Fill Window',
+};
+const viewportAspects = {
+    'Fill Window': null,
+    'Landscape — 16:9': 16 / 9,
+    'Square — 1:1': 1,
+    'Portrait — 9:16': 9 / 16,
+};
+
+function getViewportAspect() {
+    return viewportAspects[viewportSettings.format] || (window.innerWidth / Math.max(1, window.innerHeight));
+}
+
+function fitViewport() {
+    const aspect = viewportAspects[viewportSettings.format];
+    if (!aspect) {
+        cnvs.classList.remove('viewport-framed');
+        cnvs.style.width = '100vw';
+        cnvs.style.height = '100vh';
+        return;
+    }
+    let width = window.innerWidth;
+    let height = window.innerHeight;
+    if (width / height > aspect) width = height * aspect;
+    else height = width / aspect;
+    cnvs.classList.add('viewport-framed');
+    cnvs.style.width = `${Math.max(1, Math.floor(width))}px`;
+    cnvs.style.height = `${Math.max(1, Math.floor(height))}px`;
+}
+
+const cameraSettings = {
+    preset: 'Static',
+    autoRotate: false,
+    autoRotateSpeed: 1.0,
+    movementSpeed: 1.0,
+    movementAmount: 1.0,
+    distance: isMobileDevice() ? 18 : 14,
+    elevation: isMobileDevice() ? 24 : 4,
+    azimuth: 0,
+    fov: 75,
+    damping: true,
+    mouseControls: true,
+};
+let cameraSettingsDirty = true;
+
+function centerVisualization() {
+    orbCtrls.target.set(0, 0, 0);
+    cameraSettings.azimuth = 0;
+    cameraSettings.elevation = isMobileDevice() ? 24 : 4;
+    cameraSettings.distance = isMobileDevice() ? 18 : 14;
+    cameraSettingsDirty = true;
+    pane?.refresh();
+}
+
+function setCameraFromSpherical(distance, elevationDeg, azimuthDeg) {
+    const elevation = THREE.MathUtils.degToRad(elevationDeg);
+    const azimuth = THREE.MathUtils.degToRad(azimuthDeg);
+    const horizontal = Math.cos(elevation) * distance;
+    cam.position.set(
+        Math.sin(azimuth) * horizontal,
+        Math.sin(elevation) * distance,
+        Math.cos(azimuth) * horizontal,
+    );
+    cam.lookAt(orbCtrls.target);
+}
+
+function updateCameraMotion(time, audio) {
+    orbCtrls.enabled = cameraSettings.mouseControls;
+    orbCtrls.enableDamping = cameraSettings.damping;
+    orbCtrls.autoRotate = cameraSettings.autoRotate && cameraSettings.preset === 'Static';
+    orbCtrls.autoRotateSpeed = cameraSettings.autoRotateSpeed;
+    cam.fov = cameraSettings.fov;
+    cam.updateProjectionMatrix();
+
+    const preset = cameraSettings.preset;
+    if (preset === 'Static') {
+        if (cameraSettingsDirty) {
+            setCameraFromSpherical(cameraSettings.distance, cameraSettings.elevation, cameraSettings.azimuth);
+            cameraSettingsDirty = false;
+        }
+        orbCtrls.update();
+        return;
+    }
+
+    const speed = cameraSettings.movementSpeed;
+    const amount = cameraSettings.movementAmount;
+    const t = time * speed;
+    const distance = cameraSettings.distance;
+    const baseElevation = THREE.MathUtils.degToRad(cameraSettings.elevation);
+    const baseAzimuth = THREE.MathUtils.degToRad(cameraSettings.azimuth);
+    const radius = distance * 0.42 * amount;
+    let x = 0;
+    let y = Math.sin(baseElevation) * distance;
+    let z = Math.cos(baseElevation) * distance;
+
+    switch (preset) {
+        case 'Orbit': {
+            const angle = t * 0.55 + baseAzimuth;
+            x = Math.cos(angle) * radius;
+            z = distance + Math.sin(angle) * radius * 0.25;
+            break;
+        }
+        case 'Horizontal Orbit': {
+            const angle = t * 0.42 + baseAzimuth;
+            x = Math.sin(angle) * distance * amount;
+            z = Math.cos(angle) * distance;
+            break;
+        }
+        case 'Vertical Arc': {
+            const angle = Math.sin(t * 0.38) * Math.PI * 0.34 * amount + baseElevation;
+            x = Math.sin(baseAzimuth) * distance * 0.15;
+            y = Math.sin(angle) * distance;
+            z = Math.max(4, Math.cos(angle) * distance);
+            break;
+        }
+        case 'Helix': {
+            const angle = t * 0.4 + baseAzimuth;
+            x = Math.sin(angle) * distance * amount;
+            z = Math.cos(angle) * distance;
+            y = Math.sin(t * 0.18) * distance * 0.3 * amount;
+            break;
+        }
+        case 'Pendulum': {
+            x = Math.sin(t * 0.52) * radius * 1.15;
+            y = Math.sin(t * 0.26 + 0.8) * radius * 0.28;
+            z = Math.max(4, distance + Math.cos(t * 0.52) * radius * 0.18);
+            break;
+        }
+        case 'Cinematic Sweep': {
+            x = Math.sin(t * 0.22) * radius * 1.35;
+            y = Math.sin(t * 0.15 + 1.1) * radius * 0.42;
+            z = Math.max(4, distance + Math.cos(t * 0.27) * radius * 0.34);
+            break;
+        }
+        case 'Figure Eight': {
+            const angle = t * 0.5;
+            x = Math.sin(angle) * radius;
+            y = Math.sin(angle * 2) * radius * 0.5;
+            z = distance;
+            break;
+        }
+        case 'Push / Pull': {
+            z = Math.max(4, distance + Math.sin(t * 0.7) * distance * 0.35 * amount);
+            break;
+        }
+        case 'Drift': {
+            x = Math.sin(t * 0.42) * radius;
+            y = Math.sin(t * 0.31 + 1.35) * radius * 0.6;
+            z = Math.max(4, distance + Math.sin(t * 0.23 + 2.1) * radius * 0.45);
+            break;
+        }
+        case 'Audio Follow': {
+            const centroid = getSpectralCentroid();
+            const energy = audio?.level || 0;
+            const angle = baseAzimuth + (centroid - 0.5) * Math.PI * amount;
+            x = Math.sin(angle) * distance;
+            z = Math.cos(angle) * distance;
+            y = Math.sin(baseElevation) * distance + (energy - 0.5) * distance * 0.15 * amount;
+            break;
+        }
+        default:
+            break;
+    }
+
+    if (cameraSettings.autoRotate) {
+        const angle = t * 0.15 * cameraSettings.autoRotateSpeed;
+        const rotatedX = x * Math.cos(angle) + z * Math.sin(angle);
+        const rotatedZ = -x * Math.sin(angle) + z * Math.cos(angle);
+        x = rotatedX;
+        z = rotatedZ;
+    }
+
+    cam.position.set(x, y, z);
+    cam.lookAt(orbCtrls.target);
+    orbCtrls.update();
+}
+
+const exportSettings = {
+    fileName: 'metallic-vis',
+    resolution: '1080',
+    frameRate: '60',
+    bitrateMbps: '16',
+    videoType: 'Auto',
+    status: 'Idle',
+};
+let exportOverrideSize = null;
+let mediaRecorder = null;
+let recordedChunks = [];
+let exportStopAt = null;
+let exportPreviousLoop = false;
+
+function getExportDimensions() {
+    const shortSideMap = { '1080': 1080, '2K': 1440, '4K': 2160 };
+    const shortSide = shortSideMap[exportSettings.resolution] || 1080;
+    const aspect = getViewportAspect();
+    let width;
+    let height;
+    if (aspect >= 1) {
+        height = shortSide;
+        width = Math.round(height * aspect);
+    } else {
+        width = shortSide;
+        height = Math.round(width / aspect);
+    }
+    if (width % 2) width++;
+    if (height % 2) height++;
+    return { width, height };
+}
+
+function safeFileName(extension) {
+    const base = (exportSettings.fileName || audioInfo.name.replace(/\.[^.]+$/, '') || 'metallic-vis')
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
+        .trim() || 'metallic-vis';
+    return `${base}.${extension}`;
+}
+
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function renderCurrentFrame() {
+    scene.background = blackColor;
+    effectComposer1.render();
+    scene.background = activeBackgroundTexture || cubeTexture || blackColor;
+    effectComposer2.render();
+}
+
+async function exportPng() {
+    const priorOverride = exportOverrideSize;
+    exportOverrideSize = getExportDimensions();
+    resizeRendererToDisplaySize();
+    renderCurrentFrame();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    const blob = await new Promise((resolve) => cnvs.toBlob(resolve, 'image/png'));
+    exportOverrideSize = priorOverride;
+    resizeRendererToDisplaySize();
+    if (blob) downloadBlob(blob, safeFileName('png'));
+}
+
+function collectSettings() {
+    return {
+        version: 1,
+        background: currentBackgroundName,
+        mesh: currentMeshName,
+        viewport: { ...viewportSettings },
+        camera: { ...cameraSettings },
+        audioReactive: { ...audioReactive },
+        audioResolution: audioSettings.fftSize,
+        loop: { ...loopSettings },
+        dissolve: {
+            dissolveProgress: tweaks.dissolveProgress,
+            edgeWidth: tweaks.edgeWidth,
+            amplitude: tweaks.amplitude,
+            frequency: tweaks.frequency,
+            meshVisible: tweaks.meshVisible,
+            meshColor: tweaks.meshColor,
+            edgeColor: tweaks.edgeColor,
+            autoDissolve: tweaks.autoDissolve,
+        },
+        particle: {
+            particleVisible: tweaks.particleVisible,
+            particleBaseSize: tweaks.particleBaseSize,
+            particleColor: tweaks.particleColor,
+            particleSpeedFactor: tweaks.particleSpeedFactor,
+            velocityFactor: { ...particleData.velocityFactor },
+            waveAmplitude: tweaks.waveAmplitude,
+        },
+        bloomStrength: tweaks.bloomStrength,
+        rotationY: tweaks.rotationY,
+    };
+}
+
+function exportJson() {
+    const blob = new Blob([JSON.stringify(collectSettings(), null, 2)], { type: 'application/json' });
+    downloadBlob(blob, safeFileName('json'));
+}
+
+const importJsonInput = document.createElement('input');
+importJsonInput.type = 'file';
+importJsonInput.accept = 'application/json,.json';
+importJsonInput.hidden = true;
+document.body.appendChild(importJsonInput);
+
+async function applyImportedSettings(data) {
+    if (!data || typeof data !== 'object') throw new Error('Invalid settings file.');
+    if (data.audioReactive) Object.assign(audioReactive, data.audioReactive);
+    if (data.audioResolution) setAudioResolution(data.audioResolution);
+    if (data.loop) Object.assign(loopSettings, data.loop);
+    if (data.viewport) Object.assign(viewportSettings, data.viewport);
+    if (data.camera) Object.assign(cameraSettings, data.camera);
+    if (data.dissolve) {
+        Object.assign(tweaks, data.dissolve);
+        dissolveUniformData.uProgress.value = tweaks.dissolveProgress;
+        dissolveUniformData.uEdge.value = tweaks.edgeWidth;
+        dissolveUniformData.uAmp.value = tweaks.amplitude;
+        dissolveUniformData.uFreq.value = tweaks.frequency;
+        phyMat.color.set(tweaks.meshColor);
+        dissolveUniformData.uEdgeColor.value.set(tweaks.edgeColor);
+        mesh.visible = tweaks.meshVisible;
+    }
+    if (data.particle) {
+        Object.assign(tweaks, data.particle);
+        particlesUniformData.uBaseSize.value = tweaks.particleBaseSize;
+        particlesUniformData.uColor.value.set(tweaks.particleColor);
+        particleData.particleSpeedFactor = tweaks.particleSpeedFactor;
+        particleData.waveAmplitude = tweaks.waveAmplitude;
+        if (data.particle.velocityFactor) Object.assign(particleData.velocityFactor, data.particle.velocityFactor);
+        particleMesh.visible = tweaks.particleVisible;
+    }
+    if (Number.isFinite(data.bloomStrength)) {
+        tweaks.bloomStrength = data.bloomStrength;
+        unrealBloomPass.strength = data.bloomStrength;
+    }
+    if (Number.isFinite(data.rotationY)) {
+        tweaks.rotationY = data.rotationY;
+        mesh.rotation.y = particleMesh.rotation.y = data.rotationY;
+    }
+    if (data.background && backgroundPresets[data.background]) await loadBackground(data.background);
+    if (data.mesh && geoNames.includes(data.mesh)) handleMeshChange(geometries[geoNames.indexOf(data.mesh)], data.mesh);
+    fitViewport();
+    cameraSettingsDirty = true;
+    updateAudioLoopMode();
+    pane.refresh();
+}
+
+importJsonInput.addEventListener('change', async () => {
+    const file = importJsonInput.files?.[0];
+    if (!file) return;
+    try {
+        await applyImportedSettings(JSON.parse(await file.text()));
+        exportSettings.status = 'Settings imported';
+    } catch (error) {
+        console.error(error);
+        exportSettings.status = 'Import failed';
+    } finally {
+        importJsonInput.value = '';
+        pane.refresh();
+    }
+});
+
+function chooseRecordingMimeType() {
+    const requested = exportSettings.videoType;
+    const candidates = requested === 'MP4'
+        ? ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4']
+        : requested === 'WebM'
+            ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+            : ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+    return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+}
+
+function stopVideoExport() {
+    if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+}
+
+async function startVideoExport() {
+    if (mediaRecorder?.state === 'recording') {
+        stopVideoExport();
+        return;
+    }
+    if (!audioElement.src) {
+        exportSettings.status = 'Load audio before video export';
+        pane.refresh();
+        return;
+    }
+    if (!window.MediaRecorder || !cnvs.captureStream) {
+        exportSettings.status = 'Video export unsupported';
+        pane.refresh();
+        return;
+    }
+
+    ensureAudioAnalyser();
+    if (audioContext.state === 'suspended') await audioContext.resume();
+    exportOverrideSize = getExportDimensions();
+    resizeRendererToDisplaySize();
+
+    const frameRate = Number(exportSettings.frameRate) || 60;
+    const canvasStream = cnvs.captureStream(frameRate);
+    const tracks = [...canvasStream.getVideoTracks()];
+    if (recordingDestination?.stream?.getAudioTracks().length) {
+        tracks.push(...recordingDestination.stream.getAudioTracks());
+    }
+    const stream = new MediaStream(tracks);
+    const mimeType = chooseRecordingMimeType();
+    const options = {
+        videoBitsPerSecond: Math.max(1, Number(exportSettings.bitrateMbps) || 16) * 1_000_000,
+    };
+    if (mimeType) options.mimeType = mimeType;
+
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream, options);
+    mediaRecorder.addEventListener('dataavailable', (event) => {
+        if (event.data?.size) recordedChunks.push(event.data);
+    });
+    mediaRecorder.addEventListener('stop', () => {
+        const type = mediaRecorder.mimeType || mimeType || 'video/webm';
+        const extension = type.includes('mp4') ? 'mp4' : 'webm';
+        if (recordedChunks.length) downloadBlob(new Blob(recordedChunks, { type }), safeFileName(extension));
+        exportOverrideSize = null;
+        resizeRendererToDisplaySize();
+        exportSettings.status = 'Video exported';
+        mediaRecorder = null;
+        exportStopAt = null;
+        loopSettings.enabled = exportPreviousLoop;
+        updateAudioLoopMode();
+        pane.refresh();
+    });
+
+    const duration = audioElement.duration || 0;
+    const useLoopRange = loopSettings.enabled && duration > 0;
+    const start = useLoopRange ? Math.max(0, loopSettings.start) : 0;
+    const end = useLoopRange ? Math.min(duration, loopSettings.end || duration) : duration;
+    exportPreviousLoop = loopSettings.enabled;
+    loopSettings.enabled = false;
+    updateAudioLoopMode();
+    audioElement.currentTime = start;
+    exportStopAt = end;
+    exportSettings.status = 'Exporting video…';
+    mediaRecorder.start(500);
+    await audioElement.play();
+    pane.refresh();
+}
+
+fitViewport();
+window.addEventListener('resize', () => fitViewport());
 
 const controlsContainer = document.getElementById('controls');
 if (!controlsContainer) throw new Error('Controls container was not found.');
 
-const pane = new Pane({
-    title: 'Controls',
-    expanded: true,
-    container: controlsContainer,
-});
-const controller = pane;
-
+let pane = null;
+let meshBlade = null;
+let progressBinding = null;
+let fpsBinding = null;
 const performanceStats = { fps: 0 };
-const fpsBinding = controller.addBinding(performanceStats, "fps", { label: "FPS", readonly: true });
 let fpsFrameCount = 0;
 let fpsSampleStart = performance.now();
 
-const audioFolder = controller.addFolder({ title: "Audio", expanded: true });
-audioFolder.addButton({ title: "Load Audio" }).on('click', () => audioFileInput.click());
-audioFolder.addButton({ title: "Play / Pause" }).on('click', () => { void toggleAudioPlayback(); });
-audioFolder.addBinding(audioReactive, "sensitivity", { min: 0.1, max: 4, step: 0.01, label: "Sensitivity" });
-audioFolder.addBinding(audioReactive, "smoothing", { min: 0, max: 0.95, step: 0.01, label: "Smoothing" });
+async function loadPaneConstructor() {
+    const sources = [
+        'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.min.js',
+        'https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/+esm',
+        'https://unpkg.com/tweakpane@4.0.5/dist/tweakpane.min.js',
+    ];
+    let lastError = null;
+    for (const source of sources) {
+        try {
+            const module = await import(source);
+            if (typeof module.Pane === 'function') return module.Pane;
+        } catch (error) {
+            lastError = error;
+            console.warn(`Tweakpane failed to load from ${source}`, error);
+        }
+    }
+    throw lastError || new Error('Tweakpane could not be loaded.');
+}
 
-const reactivityFolder = audioFolder.addFolder({ title: "Reactivity", expanded: true });
-reactivityFolder.addBinding(audioReactive, "lowMeshSizeResponse", { min: 0, max: 1.5, step: 0.01, label: "Low → Mesh Size" });
-reactivityFolder.addBinding(audioReactive, "midsBloomResponse", { min: 0, max: 5, step: 0.01, label: "Mids → Bloom" });
-reactivityFolder.addBinding(audioReactive, "highsBloomResponse", { min: 0, max: 5, step: 0.01, label: "Highs → Bloom" });
-reactivityFolder.addBinding(audioReactive, "midsParticleSizeResponse", { min: 0, max: 5, step: 0.01, label: "Mids → Particle Size" });
-reactivityFolder.addBinding(audioReactive, "highsParticleSizeResponse", { min: 0, max: 5, step: 0.01, label: "Highs → Particle Size" });
+async function initControls() {
+    try {
+        const Pane = await loadPaneConstructor();
+        pane = new Pane({
+            title: 'Controls',
+            expanded: true,
+            container: controlsContainer,
+        });
+        const controller = pane;
+        fpsBinding = controller.addBinding(performanceStats, 'fps', { label: 'FPS', readonly: true });
 
-const frequencyFolder = audioFolder.addFolder({ title: "Frequency Bands", expanded: false });
-frequencyFolder.addBinding(audioReactive, "bassMinHz", { min: 20, max: 20000, step: 10, label: "Low Min Hz" });
-frequencyFolder.addBinding(audioReactive, "bassMaxHz", { min: 20, max: 20000, step: 10, label: "Low Max Hz" });
-frequencyFolder.addBinding(audioReactive, "midsMinHz", { min: 20, max: 20000, step: 10, label: "Mids Min Hz" });
-frequencyFolder.addBinding(audioReactive, "midsMaxHz", { min: 20, max: 20000, step: 10, label: "Mids Max Hz" });
-frequencyFolder.addBinding(audioReactive, "highsMinHz", { min: 20, max: 20000, step: 10, label: "Highs Min Hz" });
-frequencyFolder.addBinding(audioReactive, "highsMaxHz", { min: 20, max: 20000, step: 10, label: "Highs Max Hz" });
+        const audioFolder = controller.addFolder({ title: 'Audio Source', expanded: true });
+        audioFolder.addButton({ title: 'Load Audio File' }).on('click', () => audioFileInput.click());
+        audioFolder.addButton({ title: 'Play / Pause' }).on('click', () => { void toggleAudioPlayback(); });
 
+        audioInfoBindings = [
+            audioFolder.addBinding(audioInfo, 'name', { label: 'Name', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'type', { label: 'Type', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'size', { label: 'Size', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'duration', { label: 'Duration', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'sampleRate', { label: 'Sample Rate', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'channels', { label: 'Channels', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'decode', { label: 'Decode', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'status', { label: 'Status', readonly: true }),
+            audioFolder.addBinding(audioInfo, 'currentTime', { label: 'Time', readonly: true }),
+        ];
+        seekBinding = audioFolder.addBinding(audioInfo, 'seekPercent', { min: 0, max: 100, step: 0.1, label: 'Seek %' }).on('change', (event) => {
+            const duration = audioElement.duration || 0;
+            if (duration > 0) audioElement.currentTime = duration * (event.value / 100);
+        });
+        audioFolder.addBinding(audioInfo, 'volume', { min: 0, max: 100, step: 1, label: 'Volume' }).on('change', (event) => {
+            audioElement.volume = event.value / 100;
+        });
+        audioFolder.addBinding(audioInfo, 'muted', { label: 'Mute' }).on('change', (event) => {
+            audioElement.muted = event.value;
+        });
 
-const backgroundFolder = controller.addFolder({ title: "Background", expanded: false });
-const backgroundBlade = createTweakList(backgroundFolder, 'Background', backgroundNames, backgroundNames);
-backgroundBlade.on('change', (event) => { void loadBackground(event.value); });
+        const loopFolder = audioFolder.addFolder({ title: 'Loop', expanded: false });
+        loopBindings = [
+            loopFolder.addBinding(loopSettings, 'enabled', { label: 'Loop' }).on('change', () => updateAudioLoopMode()),
+            loopFolder.addBinding(loopSettings, 'start', { min: 0, max: 7200, step: 0.001, label: 'Start (s)' }).on('change', (event) => {
+                loopSettings.start = Math.max(0, snapLoopTime(event.value));
+                if (loopSettings.end <= loopSettings.start) loopSettings.end = loopSettings.start + 0.05;
+                updateAudioLoopMode();
+                refreshAudioInfo();
+            }),
+            loopFolder.addBinding(loopSettings, 'end', { min: 0, max: 7200, step: 0.001, label: 'End (s)' }).on('change', (event) => {
+                const duration = audioElement.duration || event.value;
+                loopSettings.end = Math.min(duration, Math.max(loopSettings.start + 0.05, snapLoopTime(event.value)));
+                updateAudioLoopMode();
+                refreshAudioInfo();
+            }),
+            loopFolder.addBinding(loopSettings, 'bpm', { min: 40, max: 300, step: 1, label: 'BPM' }).on('change', () => applyLoopBars()),
+            loopFolder.addBinding(loopSettings, 'bars', { min: 1, max: 999, step: 1, label: 'Bars' }).on('change', () => applyLoopBars()),
+            loopFolder.addBinding(loopSettings, 'snapToBeats', { label: 'Snap to Beats' }),
+        ];
+        loopFolder.addButton({ title: 'Detect BPM' }).on('click', async () => {
+            const bpm = await detectLoopBpm();
+            if (bpm) {
+                loopSettings.bpm = bpm;
+                applyLoopBars();
+                pane.refresh();
+            }
+        });
+        loopFolder.addButton({ title: 'Full Track' }).on('click', () => setFullTrackLoop());
 
+        const audioResolutionFolder = audioFolder.addFolder({ title: 'Audio Resolution', expanded: false });
+        const fftBlade = createTweakList(
+            audioResolutionFolder,
+            'FFT',
+            ['1× (256)', '2× (512)', '4× (1024)', '8× (2048)', '16× (4096)', '32× (8192)', '64× (16384)'],
+            [256, 512, 1024, 2048, 4096, 8192, 16384],
+        );
+        fftBlade.value = audioSettings.fftSize;
+        fftBlade.on('change', (event) => setAudioResolution(event.value));
 
-const meshFolder = controller.addFolder({ title: "Mesh", expanded: false });
-let meshBlade = createTweakList(meshFolder, 'Mesh', geoNames, geometries);
-meshBlade.on('change', (val) => { handleMeshChange(val.value) });
-meshFolder.addBinding(tweaks, "bloomStrength", { min: 0, max: 5, step: 0.01, label: "Bloom Strength" }).on('change', (obj) => { unrealBloomPass.strength = obj.value; })
-meshFolder.addBinding(tweaks, "rotationY", { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: "Rotation Y" }).on('change', (obj) => { particleMesh.rotation.y = mesh.rotation.y = obj.value; });
+        audioFolder.addBinding(audioReactive, 'sensitivity', { min: 0.1, max: 4, step: 0.01, label: 'Sensitivity' });
+        audioFolder.addBinding(audioReactive, 'smoothing', { min: 0, max: 0.95, step: 0.01, label: 'Smoothing' });
 
+        const reactivityFolder = audioFolder.addFolder({ title: 'Reactivity', expanded: true });
+        reactivityFolder.addBinding(audioReactive, 'lowMeshSizeResponse', { min: 0, max: 1.5, step: 0.01, label: 'Low → Mesh Size' });
+        reactivityFolder.addBinding(audioReactive, 'bloomResponse', { min: 0, max: 5, step: 0.01, label: 'Bloom' });
+        reactivityFolder.addBinding(audioReactive, 'particleSizeResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Size' });
 
-const dissolveFolder = controller.addFolder({ title: "Dissolve Effect", expanded: false, });
-dissolveFolder.addBinding(tweaks, "meshVisible", { label: "Visible" }).on('change', (obj) => { mesh.visible = obj.value; });
-let progressBinding = dissolveFolder.addBinding(tweaks, "dissolveProgress", { min: -20, max: 20, step: 0.0001, label: "Progress" }).on('change', (obj) => { dissolveUniformData.uProgress.value = obj.value; });
-dissolveFolder.addBinding(tweaks, "autoDissolve", { label: "Auto Animate" }).on('change', (obj) => { tweaks.autoDissolve = obj.value });
-dissolveFolder.addBinding(tweaks, "edgeWidth", { min: 0.1, max: 8, step: 0.001, label: "Edge Width" }).on('change', (obj) => { dissolveUniformData.uEdge.value = obj.value });
-dissolveFolder.addBinding(tweaks, "frequency", { min: 0.001, max: 2, step: 0.001, label: "Frequency" }).on('change', (obj) => { dissolveUniformData.uFreq.value = obj.value });
-dissolveFolder.addBinding(tweaks, "amplitude", { min: 0.1, max: 20, step: 0.001, label: "Amplitude" }).on('change', (obj) => { dissolveUniformData.uAmp.value = obj.value });
-dissolveFolder.addBinding(tweaks, "meshColor", { label: "Mesh Color" }).on('change', (obj) => { phyMat.color.set(obj.value) });
-dissolveFolder.addBinding(tweaks, "edgeColor", { label: "Edge Color" }).on('change', (obj) => { dissolveUniformData.uEdgeColor.value.set(obj.value); });
+        const frequencyFolder = audioFolder.addFolder({ title: 'Frequency Bands', expanded: false });
+        frequencyFolder.addBinding(audioReactive, 'bassMinHz', { min: 20, max: 20000, step: 10, label: 'Low Min Hz' });
+        frequencyFolder.addBinding(audioReactive, 'bassMaxHz', { min: 20, max: 20000, step: 10, label: 'Low Max Hz' });
+        frequencyFolder.addBinding(audioReactive, 'midsMinHz', { min: 20, max: 20000, step: 10, label: 'Mids Min Hz' });
+        frequencyFolder.addBinding(audioReactive, 'midsMaxHz', { min: 20, max: 20000, step: 10, label: 'Mids Max Hz' });
+        frequencyFolder.addBinding(audioReactive, 'highsMinHz', { min: 20, max: 20000, step: 10, label: 'Highs Min Hz' });
+        frequencyFolder.addBinding(audioReactive, 'highsMaxHz', { min: 20, max: 20000, step: 10, label: 'Highs Max Hz' });
 
+        const viewportFolder = controller.addFolder({ title: 'Viewport', expanded: false });
+        const viewportBlade = createTweakList(viewportFolder, 'Format', Object.keys(viewportAspects), Object.keys(viewportAspects));
+        viewportBlade.value = viewportSettings.format;
+        viewportBlade.on('change', (event) => {
+            viewportSettings.format = event.value;
+            fitViewport();
+        });
 
-const particleFolder = controller.addFolder({ title: "Particle", expanded: false });
-particleFolder.addBinding(tweaks, "particleVisible", { label: "Visible" }).on('change', (obj) => { particleMesh.visible = obj.value; });
-particleFolder.addBinding(tweaks, "particleBaseSize", { min: 10.0, max: 100, step: 0.01, label: "Base size" }).on('change', (obj) => { particlesUniformData.uBaseSize.value = obj.value; });
-particleFolder.addBinding(tweaks, "particleColor", { label: "Color" }).on('change', (obj) => { particlesUniformData.uColor.value.set(obj.value); });
-particleFolder.addBinding(tweaks, "particleSpeedFactor", { min: 0.001, max: 0.1, step: 0.001, label: "Speed" }).on('change', (obj) => { particleData.particleSpeedFactor = obj.value });
-particleFolder.addBinding(tweaks, "waveAmplitude", { min: 0, max: 5, step: 0.01, label: "Wave Amp" }).on('change', (obj) => { particleData.waveAmplitude = obj.value; });
-particleFolder.addBinding(tweaks, "velocityFactor", { expanded: true, picker: 'inline', label: "Velocity Factor" }).on('change', (obj) => { particleData.velocityFactor = obj.value });
+        const cameraFolder = controller.addFolder({ title: 'Camera', expanded: false });
+        const cameraPresetNames = ['Static', 'Orbit', 'Horizontal Orbit', 'Vertical Arc', 'Helix', 'Pendulum', 'Cinematic Sweep', 'Figure Eight', 'Push / Pull', 'Drift', 'Audio Follow'];
+        const cameraPresetBlade = createTweakList(cameraFolder, 'Preset', cameraPresetNames, cameraPresetNames);
+        cameraPresetBlade.value = cameraSettings.preset;
+        cameraPresetBlade.on('change', (event) => {
+            cameraSettings.preset = event.value;
+            cameraSettingsDirty = true;
+        });
+        cameraFolder.addBinding(cameraSettings, 'autoRotate', { label: 'Auto Rotate' }).on('change', () => cameraSettingsDirty = true);
+        cameraFolder.addBinding(cameraSettings, 'autoRotateSpeed', { min: -10, max: 10, step: 0.05, label: 'Rotation Speed' });
+        cameraFolder.addBinding(cameraSettings, 'movementSpeed', { min: 0.1, max: 3, step: 0.05, label: 'Movement Speed' });
+        cameraFolder.addBinding(cameraSettings, 'movementAmount', { min: 0, max: 2, step: 0.05, label: 'Movement Amount' });
+        cameraFolder.addBinding(cameraSettings, 'distance', { min: 5, max: 50, step: 0.1, label: 'Distance' }).on('change', () => cameraSettingsDirty = true);
+        cameraFolder.addBinding(cameraSettings, 'elevation', { min: -89, max: 89, step: 1, label: 'Elevation' }).on('change', () => cameraSettingsDirty = true);
+        cameraFolder.addBinding(cameraSettings, 'azimuth', { min: -180, max: 180, step: 1, label: 'Azimuth' }).on('change', () => cameraSettingsDirty = true);
+        cameraFolder.addBinding(cameraSettings, 'fov', { min: 30, max: 110, step: 1, label: 'FOV' });
+        cameraFolder.addBinding(cameraSettings, 'mouseControls', { label: 'Mouse Controls' });
+        cameraFolder.addBinding(cameraSettings, 'damping', { label: 'Damping' });
+        cameraFolder.addButton({ title: 'Center Visualization' }).on('click', () => centerVisualization());
+
+        const backgroundFolder = controller.addFolder({ title: 'Background', expanded: false });
+        const backgroundBlade = createTweakList(backgroundFolder, 'Background', backgroundNames, backgroundNames);
+        backgroundBlade.value = currentBackgroundName;
+        backgroundBlade.on('change', (event) => { void loadBackground(event.value); });
+
+        const meshFolder = controller.addFolder({ title: 'Mesh', expanded: false });
+        meshBlade = createTweakList(meshFolder, 'Mesh', geoNames, geometries);
+        meshBlade.value = geometries[0];
+        meshBlade.on('change', (event) => {
+            const index = geometries.indexOf(event.value);
+            handleMeshChange(event.value, geoNames[index] || currentMeshName);
+        });
+        meshFolder.addBinding(tweaks, 'bloomStrength', { min: 0, max: 5, step: 0.01, label: 'Bloom Strength' }).on('change', (event) => {
+            unrealBloomPass.strength = event.value;
+        });
+        meshFolder.addBinding(tweaks, 'rotationY', { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: 'Rotation Y' }).on('change', (event) => {
+            particleMesh.rotation.y = mesh.rotation.y = event.value;
+        });
+
+        const dissolveFolder = controller.addFolder({ title: 'Dissolve Effect', expanded: false });
+        dissolveFolder.addBinding(tweaks, 'meshVisible', { label: 'Visible' }).on('change', (event) => { mesh.visible = event.value; });
+        progressBinding = dissolveFolder.addBinding(tweaks, 'dissolveProgress', { min: -20, max: 20, step: 0.0001, label: 'Progress' }).on('change', (event) => { dissolveUniformData.uProgress.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'autoDissolve', { label: 'Auto Animate' });
+        dissolveFolder.addBinding(tweaks, 'edgeWidth', { min: 0.1, max: 8, step: 0.001, label: 'Edge Width' }).on('change', (event) => { dissolveUniformData.uEdge.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'frequency', { min: 0.001, max: 2, step: 0.001, label: 'Frequency' }).on('change', (event) => { dissolveUniformData.uFreq.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'amplitude', { min: 0.1, max: 20, step: 0.001, label: 'Amplitude' }).on('change', (event) => { dissolveUniformData.uAmp.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'meshColor', { label: 'Mesh Color' }).on('change', (event) => { phyMat.color.set(event.value); });
+        dissolveFolder.addBinding(tweaks, 'edgeColor', { label: 'Edge Color' }).on('change', (event) => { dissolveUniformData.uEdgeColor.value.set(event.value); });
+
+        const particleFolder = controller.addFolder({ title: 'Particle Motion', expanded: false });
+        particleFolder.addBinding(tweaks, 'particleVisible', { label: 'Visible' }).on('change', (event) => { particleMesh.visible = event.value; });
+        particleFolder.addBinding(tweaks, 'particleBaseSize', { min: 10, max: 100, step: 0.01, label: 'Base Size' }).on('change', (event) => { particlesUniformData.uBaseSize.value = event.value; });
+        particleFolder.addBinding(tweaks, 'particleColor', { label: 'Color' }).on('change', (event) => { particlesUniformData.uColor.value.set(event.value); });
+        particleFolder.addBinding(tweaks, 'particleSpeedFactor', { min: 0.001, max: 0.1, step: 0.001, label: 'Speed' }).on('change', (event) => { particleData.particleSpeedFactor = event.value; });
+        particleFolder.addBinding(tweaks, 'waveAmplitude', { min: 0, max: 5, step: 0.01, label: 'Wave Amplitude' }).on('change', (event) => { particleData.waveAmplitude = event.value; });
+        particleFolder.addBinding(tweaks, 'velocityFactor', { expanded: true, picker: 'inline', label: 'Velocity Factor' }).on('change', (event) => { particleData.velocityFactor = event.value; });
+
+        const exportFolder = controller.addFolder({ title: 'Export', expanded: false });
+        exportFolder.addBinding(exportSettings, 'fileName', { label: 'File Name' });
+        const exportResolutionBlade = createTweakList(exportFolder, 'Resolution', ['1080', '2K', '4K'], ['1080', '2K', '4K']);
+        exportResolutionBlade.value = exportSettings.resolution;
+        exportResolutionBlade.on('change', (event) => exportSettings.resolution = event.value);
+        const exportFpsBlade = createTweakList(exportFolder, 'Frame Rate', ['24 FPS', '30 FPS', '60 FPS'], ['24', '30', '60']);
+        exportFpsBlade.value = exportSettings.frameRate;
+        exportFpsBlade.on('change', (event) => exportSettings.frameRate = event.value);
+        const exportBitrateBlade = createTweakList(exportFolder, 'Bitrate', ['6 Mbps', '10 Mbps', '16 Mbps', '24 Mbps'], ['6', '10', '16', '24']);
+        exportBitrateBlade.value = exportSettings.bitrateMbps;
+        exportBitrateBlade.on('change', (event) => exportSettings.bitrateMbps = event.value);
+        const exportTypeBlade = createTweakList(exportFolder, 'Video Type', ['Auto', 'MP4', 'WebM'], ['Auto', 'MP4', 'WebM']);
+        exportTypeBlade.value = exportSettings.videoType;
+        exportTypeBlade.on('change', (event) => exportSettings.videoType = event.value);
+        exportFolder.addButton({ title: 'Export Video' }).on('click', () => { void startVideoExport(); });
+        exportFolder.addButton({ title: 'Export PNG' }).on('click', () => { void exportPng(); });
+        exportFolder.addButton({ title: 'Export JSON' }).on('click', () => exportJson());
+        exportFolder.addButton({ title: 'Import JSON' }).on('click', () => importJsonInput.click());
+        exportFolder.addBinding(exportSettings, 'status', { label: 'Status', readonly: true });
+    } catch (error) {
+        console.error('Controls failed to initialize.', error);
+        controlsContainer.textContent = 'Controls failed to load. Refresh the page to retry.';
+        controlsContainer.classList.add('control-panel--error');
+    }
+}
+
+void initControls();
 
 let dissolving = true;
 let geoIdx = 0;
@@ -974,12 +1827,13 @@ function animateDissolve() {
     if (progress.value > 14 && dissolving) {
         dissolving = false;
         geoIdx++;
-        handleMeshChange(geometries[geoIdx % geoLength]);
-                meshBlade.value = geometries[geoIdx % geoLength];
+        const nextIndex = geoIdx % geoLength;
+        handleMeshChange(geometries[nextIndex], geoNames[nextIndex]);
+        if (meshBlade) meshBlade.value = geometries[nextIndex];
     };
     if (progress.value < -17 && !dissolving) dissolving = true;
 
-    progressBinding.controller.value.setRawValue(progress.value);
+    if (progressBinding) progressBinding.controller.value.setRawValue(progress.value);
 }
 
 
@@ -991,9 +1845,6 @@ function floatMeshes(time) {
 
 const clock = new THREE.Clock();
 function animate() {
-    //   stat.update();
-    orbCtrls.update();
-
     let time = clock.getElapsedTime();
 
     animateDissolve();
@@ -1005,19 +1856,24 @@ function animate() {
     const baseBloomStrength = unrealBloomPass.strength;
     const audio = readAudioLevels();
 
+    if (loopSettings.enabled && !audioElement.paused && Number.isFinite(audioElement.duration) && audioElement.duration > 0) {
+        const loopStart = Math.max(0, Math.min(audioElement.duration, loopSettings.start));
+        const loopEnd = Math.max(loopStart + 0.01, Math.min(audioElement.duration, loopSettings.end || audioElement.duration));
+        const partialLoop = loopStart > 0.001 || loopEnd < audioElement.duration - 0.001;
+        if (partialLoop && audioElement.currentTime >= loopEnd - 0.015) {
+            audioElement.currentTime = loopStart;
+        }
+    }
+
     const meshScale = 1 + audio.bass * audioReactive.lowMeshSizeResponse;
     mesh.scale.setScalar(meshScale);
     particleMesh.scale.setScalar(meshScale);
 
-    const bloomGain =
-        audio.mids * audioReactive.midsBloomResponse +
-        audio.highs * audioReactive.highsBloomResponse;
-    unrealBloomPass.strength = baseBloomStrength * (1 + bloomGain);
+    const midHighMagnitude = Math.max(audio.mids, audio.highs);
+    unrealBloomPass.strength = baseBloomStrength * (1 + midHighMagnitude * audioReactive.bloomResponse);
+    particlesUniformData.uBaseSize.value = baseParticleSize * (1 + midHighMagnitude * audioReactive.particleSizeResponse);
 
-    const particleSizeGain =
-        audio.mids * audioReactive.midsParticleSizeResponse +
-        audio.highs * audioReactive.highsParticleSizeResponse;
-    particlesUniformData.uBaseSize.value = baseParticleSize * (1 + particleSizeGain);
+    updateCameraMotion(time, audio);
 
     updateParticleAttributes();
 
@@ -1036,6 +1892,11 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
+    if (mediaRecorder?.state === 'recording' && exportStopAt != null && audioElement.currentTime >= exportStopAt - 0.02) {
+        audioElement.pause();
+        stopVideoExport();
+    }
+
     // Restore baseline values so audio reactivity never rewrites user controls.
     particlesUniformData.uBaseSize.value = baseParticleSize;
     unrealBloomPass.strength = baseBloomStrength;
@@ -1045,7 +1906,7 @@ function animate() {
     const fpsElapsed = now - fpsSampleStart;
     if (fpsElapsed >= 500) {
         performanceStats.fps = Math.round((fpsFrameCount * 1000) / fpsElapsed);
-        fpsBinding.refresh();
+        if (fpsBinding) fpsBinding.refresh();
         fpsFrameCount = 0;
         fpsSampleStart = now;
     }
@@ -1055,6 +1916,7 @@ function animate() {
 requestAnimationFrame(animate);
 
 window.addEventListener('orientationchange', () => {
-    location.reload();
+    fitViewport();
+    cameraSettingsDirty = true;
 });
 
