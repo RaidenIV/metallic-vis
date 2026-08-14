@@ -184,6 +184,7 @@ let audioObjectUrl = null;
 const audioReactive = {
     sensitivity: 1.35,
     smoothing: 0.78,
+    shapeResponse: 0.9,
     dissolveResponse: 4.5,
     particleResponse: 2.0,
     bloomResponse: 1.8,
@@ -350,6 +351,14 @@ const dissolveUniformData = {
     }
 }
 
+const shapeUniformData = {
+    uShapeBass: { value: 0 },
+    uShapeMids: { value: 0 },
+    uShapeHighs: { value: 0 },
+    uShapeTime: { value: 0 },
+    uShapeStrength: { value: audioReactive.shapeResponse },
+};
+
 
 function setupUniforms(shader, uniforms) {
     const keys = Object.keys(uniforms);
@@ -360,14 +369,53 @@ function setupUniforms(shader, uniforms) {
 }
 
 function setupDissolveShader(shader) {
-    // vertex shader snippet outside main
+    // Deform the metallic mesh along its surface normals using separate audio
+    // bands. With zero audio input every offset resolves to zero, so the
+    // original geometry is preserved exactly when playback stops.
     shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>
         varying vec3 vPos;
+
+        uniform float uShapeBass;
+        uniform float uShapeMids;
+        uniform float uShapeHighs;
+        uniform float uShapeTime;
+        uniform float uShapeStrength;
+
+        ${snoise}
     `);
 
-    // vertex shader snippet inside main
     shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
-        vPos = position;
+        vec3 shapeNormal = normalize(normal);
+
+        float bassWave = 0.5 + 0.5 * sin(
+            position.y * 1.35 - uShapeTime * 5.0 +
+            sin(position.x * 0.65 + position.z * 0.65)
+        );
+
+        float midWave = snoise(
+            position * 0.48 + vec3(
+                uShapeTime * 0.55,
+                -uShapeTime * 0.35,
+                uShapeTime * 0.25
+            )
+        );
+
+        float highWave = snoise(
+            position * 1.85 + vec3(
+                -uShapeTime * 1.15,
+                uShapeTime * 0.95,
+                uShapeTime * 1.25
+            )
+        );
+
+        float shapeOffset = uShapeStrength * (
+            uShapeBass * (0.20 + bassWave * 0.55) +
+            uShapeMids * midWave * 0.24 +
+            uShapeHighs * highWave * 0.07
+        );
+
+        transformed += shapeNormal * shapeOffset;
+        vPos = transformed;
     `);
 
     // fragment shader snippet outside main
@@ -404,6 +452,7 @@ function setupDissolveShader(shader) {
 
 phyMat.onBeforeCompile = (shader) => {
     setupUniforms(shader, dissolveUniformData);
+    setupUniforms(shader, shapeUniformData);
     setupDissolveShader(shader);
 }
 
@@ -725,6 +774,7 @@ audioFolder.addButton({ title: "Load Audio" }).on('click', () => audioFileInput.
 audioFolder.addButton({ title: "Play / Pause" }).on('click', () => { void toggleAudioPlayback(); });
 audioFolder.addBinding(audioReactive, "sensitivity", { min: 0.1, max: 4, step: 0.01, label: "Sensitivity" });
 audioFolder.addBinding(audioReactive, "smoothing", { min: 0, max: 0.95, step: 0.01, label: "Smoothing" });
+audioFolder.addBinding(audioReactive, "shapeResponse", { min: 0, max: 2.5, step: 0.01, label: "Shape" });
 audioFolder.addBinding(audioReactive, "dissolveResponse", { min: 0, max: 10, step: 0.01, label: "Dissolve" });
 audioFolder.addBinding(audioReactive, "particleResponse", { min: 0, max: 5, step: 0.01, label: "Particles" });
 audioFolder.addBinding(audioReactive, "bloomResponse", { min: 0, max: 5, step: 0.01, label: "Bloom" });
@@ -807,6 +857,16 @@ function animate() {
     const baseBloomStrength = shaderPass.uniforms.uStrength.value;
 
     const audio = readAudioLevels();
+
+    // Shape reactivity is evaluated in the metallic material's vertex shader.
+    // Bass creates broad traveling bulges, mids create organic surface waves,
+    // and highs add fine vibration. All displacement follows the vertex normal.
+    shapeUniformData.uShapeBass.value = audio.bass;
+    shapeUniformData.uShapeMids.value = audio.mids;
+    shapeUniformData.uShapeHighs.value = audio.highs;
+    shapeUniformData.uShapeTime.value = time;
+    shapeUniformData.uShapeStrength.value = audioReactive.shapeResponse;
+
     dissolveUniformData.uProgress.value = baseProgress + (audio.bass * audioReactive.dissolveResponse);
     dissolveUniformData.uEdge.value = baseEdge * (1 + audio.highs * 0.6);
     particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.mids * audioReactive.particleResponse);
