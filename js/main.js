@@ -819,6 +819,9 @@ const dissolveUniformData = {
     },
     uMotionAngle: {
         value: 0.0
+    },
+    uMotionOffset: {
+        value: new THREE.Vector3(0, 0, 0)
     }
 }
 
@@ -850,6 +853,7 @@ function setupDissolveShader(shader) {
         uniform float uProgress;
         uniform float uEdge;
         uniform float uMotionAngle;
+        uniform vec3 uMotionOffset;
         uniform vec3 uEdgeColor;
 
         ${snoise}
@@ -860,12 +864,25 @@ function setupDissolveShader(shader) {
 
         float motionCos = cos(uMotionAngle);
         float motionSin = sin(uMotionAngle);
-        vec3 movingNoisePos = vec3(
+        vec3 rotatedNoisePos = vec3(
             motionCos * vPos.x - motionSin * vPos.z,
             vPos.y,
             motionSin * vPos.x + motionCos * vPos.z
         );
-        float noise = snoise(movingNoisePos * uFreq) * uAmp; // rotate the dissolve field around the mesh without changing dissolve progress
+
+        // Give the dissolve field a second-axis rotation plus a translated
+        // 3D drift. This makes dissolved regions flow across and around the
+        // surface rather than only orbiting around the mesh's Y axis.
+        float tiltAngle = uMotionAngle * 0.73;
+        float tiltCos = cos(tiltAngle);
+        float tiltSin = sin(tiltAngle);
+        vec3 tiltedNoisePos = vec3(
+            rotatedNoisePos.x,
+            tiltCos * rotatedNoisePos.y - tiltSin * rotatedNoisePos.z,
+            tiltSin * rotatedNoisePos.y + tiltCos * rotatedNoisePos.z
+        );
+        vec3 movingNoisePos = tiltedNoisePos + uMotionOffset;
+        float noise = snoise(movingNoisePos * uFreq) * uAmp;
 
         if(noise < uProgress) discard; // discard any fragment where noise is lower than progress
 
@@ -1874,13 +1891,24 @@ function animate() {
     const baseBloomStrength = unrealBloomPass.strength;
     const audio = readAudioLevels();
 
-    // Move the existing dissolve pattern around the mesh without changing the
-    // dissolve threshold. The phase only advances when audio magnitude exists,
-    // so silence leaves the pattern stationary.
+    // Move the existing dissolve field dynamically through 3D object space
+    // without changing the dissolve threshold. Overall level controls travel
+    // speed while bass/mids/highs independently influence the spatial drift.
+    // Silence freezes the current pattern in place.
     if (audioReactive.dissolveMotionResponse > 0 && audio.level > 0) {
         dissolveMotionPhase += audio.level * audioReactive.dissolveMotionResponse * animationDelta * 2.5;
+
+        dissolveUniformData.uMotionAngle.value = dissolveMotionPhase;
+        dissolveUniformData.uMotionOffset.value.set(
+            Math.sin(dissolveMotionPhase * 0.83) * (2.0 + audio.mids * 6.0),
+            Math.cos(dissolveMotionPhase * 0.61) * (1.5 + audio.highs * 5.0),
+            Math.sin(dissolveMotionPhase * 0.47 + 1.2) * (2.0 + audio.bass * 6.0)
+        );
+    } else if (audioReactive.dissolveMotionResponse <= 0) {
+        dissolveMotionPhase = 0;
+        dissolveUniformData.uMotionAngle.value = 0;
+        dissolveUniformData.uMotionOffset.value.set(0, 0, 0);
     }
-    dissolveUniformData.uMotionAngle.value = dissolveMotionPhase;
 
     if (loopSettings.enabled && !audioElement.paused && Number.isFinite(audioElement.duration) && audioElement.duration > 0) {
         const loopStart = Math.max(0, Math.min(audioElement.duration, loopSettings.start));
