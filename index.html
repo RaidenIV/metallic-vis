@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#000000" />
+    <title>Dissolve Effect</title>
+    <link rel="stylesheet" href="./style.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.172.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body class="loading">
+    <header class="site-header">
+      <div class="site-header__inner">
+        <h1>Dissolve Effect</h1>
+        <nav class="site-nav" aria-label="Project links">
+          <a href="https://tympanus.net/codrops/?p=">Tutorial</a>
+          <a href="https://github.com/JatinChopra/emissive-dissolve-effect">GitHub</a>
+          <a href="https://tympanus.net/codrops/demos/">All demos</a>
+        </nav>
+      </div>
+    </header>
+
+    <canvas id="c"></canvas>
+
+    <footer class="site-footer">
+      <nav class="tag-nav" aria-label="Tags">
+        <a href="https://tympanus.net/codrops/demos/?tag=glsl">#glsl</a>
+        <a href="https://tympanus.net/codrops/demos/?tag=three-js">#three.js</a>
+        <a href="https://tympanus.net/codrops/demos/?tag=webgl">#webgl</a>
+      </nav>
+    </footer>
+
+    <script type="module" src="./js/main.js"></script>
+  </body>
+</html>
