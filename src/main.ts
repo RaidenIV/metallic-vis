@@ -213,7 +213,7 @@ function generateCubeUrls(prefix: string, postfix: string) {
 }
 
 
-cubeTextureUrls = generateCubeUrls('/cubeMap2/', '.png');
+cubeTextureUrls = generateCubeUrls(`${import.meta.env.BASE_URL}cubeMap2/`, '.png');
 
 
 async function loadTextures() {
@@ -248,7 +248,7 @@ let geometries = [torusKnot, teaPot, sphere, torus];
 
 
 let particleTexture: THREE.Texture;
-particleTexture = new THREE.TextureLoader().load('/particle.png')
+particleTexture = new THREE.TextureLoader().load(`${import.meta.env.BASE_URL}particle.png`)
 
 
 let mesh: THREE.Object3D;
