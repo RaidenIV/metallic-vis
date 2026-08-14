@@ -291,11 +291,13 @@ function getBandLevel(minHz, maxHz) {
 
 function readAudioLevels() {
     if (!audioAnalyser || !audioFrequencyData || audioElement.paused) {
+        clearMeshSpectrum();
         return { bass: 0, mids: 0, highs: 0, level: 0 };
     }
 
     audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
     audioAnalyser.getByteFrequencyData(audioFrequencyData);
+    updateMeshSpectrum();
 
     const sensitivity = audioReactive.sensitivity;
     const bassMin = Math.min(audioReactive.bassMinHz, audioReactive.bassMaxHz);
@@ -484,8 +486,65 @@ const sphere = new THREE.SphereGeometry(4.5, segments1, segments1);
 const teaPot = new TeapotGeometry(3, segments2);
 const torus = new THREE.TorusGeometry(3, 1.5, segments1, segments1);
 const torusKnot = new THREE.TorusKnotGeometry(2.5, 0.8, segments1, segments1);
-let geoNames = ["TorusKnot", "Tea Pot", "Sphere", "Torus"];
-let geometries = [torusKnot, teaPot, sphere, torus];
+const polyDetail = isMobileDevice() ? 2 : 3;
+const boxSegments = isMobileDevice() ? 18 : 32;
+const radialSegments = isMobileDevice() ? 48 : 72;
+const heightSegments = isMobileDevice() ? 18 : 32;
+const icosahedron = new THREE.IcosahedronGeometry(4.5, polyDetail);
+const dodecahedron = new THREE.DodecahedronGeometry(4.5, polyDetail);
+const octahedron = new THREE.OctahedronGeometry(4.5, polyDetail + 1);
+const cube = new THREE.BoxGeometry(7.2, 7.2, 7.2, boxSegments, boxSegments, boxSegments);
+const cylinder = new THREE.CylinderGeometry(3.5, 3.5, 7.0, radialSegments, heightSegments, false);
+const cone = new THREE.ConeGeometry(4.0, 7.5, radialSegments, heightSegments, false);
+
+function addFrequencyCoordinates(geometry) {
+    const position = geometry.getAttribute('position');
+    const coords = new Float32Array(position.count);
+
+    geometry.computeBoundingBox();
+    const box = geometry.boundingBox;
+    const minY = box?.min.y ?? -1;
+    const maxY = box?.max.y ?? 1;
+    const yRange = Math.max(0.0001, maxY - minY);
+
+    for (let i = 0; i < position.count; i++) {
+        const x = position.getX(i);
+        const y = position.getY(i);
+        const z = position.getZ(i);
+        const azimuth = (Math.atan2(z, x) + Math.PI) / (Math.PI * 2);
+        const vertical = (y - minY) / yRange;
+        coords[i] = (azimuth * 0.78 + vertical * 0.22) % 1;
+    }
+
+    geometry.setAttribute('aFrequencyCoord', new THREE.BufferAttribute(coords, 1));
+}
+
+let geoNames = [
+    "Sphere",
+    "TorusKnot",
+    "Tea Pot",
+    "Torus",
+    "Icosahedron",
+    "Dodecahedron",
+    "Octahedron",
+    "Cube",
+    "Cylinder",
+    "Cone",
+];
+let geometries = [
+    sphere,
+    torusKnot,
+    teaPot,
+    torus,
+    icosahedron,
+    dodecahedron,
+    octahedron,
+    cube,
+    cylinder,
+    cone,
+];
+
+geometries.forEach(addFrequencyCoordinates);
 
 
 let particleTexture;
@@ -521,11 +580,56 @@ const dissolveUniformData = {
     }
 }
 
+const meshSpectrumSize = 512;
+const meshSpectrumData = new Uint8Array(meshSpectrumSize);
+const meshSpectrumTexture = new THREE.DataTexture(
+    meshSpectrumData,
+    meshSpectrumSize,
+    1,
+    THREE.RedFormat,
+    THREE.UnsignedByteType
+);
+meshSpectrumTexture.minFilter = THREE.LinearFilter;
+meshSpectrumTexture.magFilter = THREE.LinearFilter;
+meshSpectrumTexture.wrapS = THREE.ClampToEdgeWrapping;
+meshSpectrumTexture.wrapT = THREE.ClampToEdgeWrapping;
+meshSpectrumTexture.generateMipmaps = false;
+meshSpectrumTexture.needsUpdate = true;
+
+function clearMeshSpectrum() {
+    meshSpectrumData.fill(0);
+    meshSpectrumTexture.needsUpdate = true;
+}
+
+function updateMeshSpectrum() {
+    if (!audioFrequencyData || audioElement.paused) {
+        clearMeshSpectrum();
+        return;
+    }
+
+    const sourceLength = audioFrequencyData.length;
+    for (let i = 0; i < meshSpectrumSize; i++) {
+        const sourceIndex = Math.min(sourceLength - 1, Math.floor((i / (meshSpectrumSize - 1)) * (sourceLength - 1)));
+        meshSpectrumData[i] = audioFrequencyData[sourceIndex];
+    }
+    meshSpectrumTexture.needsUpdate = true;
+}
+
 const shapeUniformData = {
-    uShapeBass: { value: 0 },
-    uShapeMids: { value: 0 },
-    uShapeHighs: { value: 0 },
-    uShapeTime: { value: 0 },
+    uAudioSpectrum: { value: meshSpectrumTexture },
+    uAudioNyquist: { value: 24000 },
+    uAudioSensitivity: { value: audioReactive.sensitivity },
+    uSpectrumMinHz: { value: audioReactive.bassMinHz },
+    uSpectrumMaxHz: { value: audioReactive.highsMaxHz },
+    uBassMinHz: { value: audioReactive.bassMinHz },
+    uBassMaxHz: { value: audioReactive.bassMaxHz },
+    uMidsMinHz: { value: audioReactive.midsMinHz },
+    uMidsMaxHz: { value: audioReactive.midsMaxHz },
+    uHighsMinHz: { value: audioReactive.highsMinHz },
+    uHighsMaxHz: { value: audioReactive.highsMaxHz },
+    uShapeBass: { value: audioReactive.bassShapeResponse },
+    uShapeMids: { value: audioReactive.midsShapeResponse },
+    uShapeHighs: { value: audioReactive.highsShapeResponse },
     uShapeStrength: { value: audioReactive.shapeResponse },
 };
 
@@ -539,51 +643,49 @@ function setupUniforms(shader, uniforms) {
 }
 
 function setupDissolveShader(shader) {
-    // Deform the metallic mesh along its surface normals using separate audio
-    // bands. With zero audio input every offset resolves to zero, so the
-    // original geometry is preserved exactly when playback stops.
+    // Each vertex is assigned a stable position in the FFT spectrum. Its
+    // displacement is the current magnitude of that exact frequency region, so
+    // there is no procedural or time-driven mesh motion when the audio is quiet.
     shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>
         varying vec3 vPos;
 
+        attribute float aFrequencyCoord;
+        uniform sampler2D uAudioSpectrum;
+        uniform float uAudioNyquist;
+        uniform float uAudioSensitivity;
+        uniform float uSpectrumMinHz;
+        uniform float uSpectrumMaxHz;
+        uniform float uBassMinHz;
+        uniform float uBassMaxHz;
+        uniform float uMidsMinHz;
+        uniform float uMidsMaxHz;
+        uniform float uHighsMinHz;
+        uniform float uHighsMaxHz;
         uniform float uShapeBass;
         uniform float uShapeMids;
         uniform float uShapeHighs;
-        uniform float uShapeTime;
         uniform float uShapeStrength;
-
-        ${snoise}
     `);
 
     shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
         vec3 shapeNormal = normalize(normal);
+        float mappedHz = mix(uSpectrumMinHz, uSpectrumMaxHz, aFrequencyCoord);
+        float spectrumU = clamp(mappedHz / max(uAudioNyquist, 1.0), 0.0, 1.0);
+        float magnitude = texture2D(uAudioSpectrum, vec2(spectrumU, 0.5)).r;
+        magnitude = clamp(magnitude * uAudioSensitivity, 0.0, 1.0);
 
-        float bassWave = 0.5 + 0.5 * sin(
-            position.y * 1.35 - uShapeTime * 5.0 +
-            sin(position.x * 0.65 + position.z * 0.65)
-        );
+        float bandWeight = 0.0;
+        if (mappedHz >= uBassMinHz && mappedHz <= uBassMaxHz) {
+            bandWeight += uShapeBass;
+        }
+        if (mappedHz >= uMidsMinHz && mappedHz <= uMidsMaxHz) {
+            bandWeight += uShapeMids;
+        }
+        if (mappedHz >= uHighsMinHz && mappedHz <= uHighsMaxHz) {
+            bandWeight += uShapeHighs;
+        }
 
-        float midWave = snoise(
-            position * 0.48 + vec3(
-                uShapeTime * 0.55,
-                -uShapeTime * 0.35,
-                uShapeTime * 0.25
-            )
-        );
-
-        float highWave = snoise(
-            position * 1.85 + vec3(
-                -uShapeTime * 1.15,
-                uShapeTime * 0.95,
-                uShapeTime * 1.25
-            )
-        );
-
-        float shapeOffset = uShapeStrength * (
-            uShapeBass * (0.20 + bassWave * 0.55) +
-            uShapeMids * midWave * 0.24 +
-            uShapeHighs * highWave * 0.07
-        );
-
+        float shapeOffset = uShapeStrength * magnitude * bandWeight;
         transformed += shapeNormal * shapeOffset;
         vPos = transformed;
     `);
@@ -1052,13 +1154,29 @@ function animate() {
 
     const audio = readAudioLevels();
 
-    // Shape reactivity is evaluated in the metallic material's vertex shader.
-    // Bass creates broad traveling bulges, mids create organic surface waves,
-    // and highs add fine vibration. All displacement follows the vertex normal.
-    shapeUniformData.uShapeBass.value = audio.bass * audioReactive.bassShapeResponse;
-    shapeUniformData.uShapeMids.value = audio.mids * audioReactive.midsShapeResponse;
-    shapeUniformData.uShapeHighs.value = audio.highs * audioReactive.highsShapeResponse;
-    shapeUniformData.uShapeTime.value = time;
+    // Mesh deformation samples the live FFT texture per vertex. The Bass/Mids/Highs
+    // controls are response weights only; the actual displacement comes entirely
+    // from the magnitude of the frequency assigned to that vertex.
+    const bassMin = Math.min(audioReactive.bassMinHz, audioReactive.bassMaxHz);
+    const bassMax = Math.max(audioReactive.bassMinHz, audioReactive.bassMaxHz);
+    const midsMin = Math.min(audioReactive.midsMinHz, audioReactive.midsMaxHz);
+    const midsMax = Math.max(audioReactive.midsMinHz, audioReactive.midsMaxHz);
+    const highsMin = Math.min(audioReactive.highsMinHz, audioReactive.highsMaxHz);
+    const highsMax = Math.max(audioReactive.highsMinHz, audioReactive.highsMaxHz);
+
+    shapeUniformData.uAudioNyquist.value = audioContext ? audioContext.sampleRate / 2 : 24000;
+    shapeUniformData.uAudioSensitivity.value = audioReactive.sensitivity;
+    shapeUniformData.uSpectrumMinHz.value = Math.min(bassMin, midsMin, highsMin);
+    shapeUniformData.uSpectrumMaxHz.value = Math.max(bassMax, midsMax, highsMax);
+    shapeUniformData.uBassMinHz.value = bassMin;
+    shapeUniformData.uBassMaxHz.value = bassMax;
+    shapeUniformData.uMidsMinHz.value = midsMin;
+    shapeUniformData.uMidsMaxHz.value = midsMax;
+    shapeUniformData.uHighsMinHz.value = highsMin;
+    shapeUniformData.uHighsMaxHz.value = highsMax;
+    shapeUniformData.uShapeBass.value = audioReactive.bassShapeResponse;
+    shapeUniformData.uShapeMids.value = audioReactive.midsShapeResponse;
+    shapeUniformData.uShapeHighs.value = audioReactive.highsShapeResponse;
     shapeUniformData.uShapeStrength.value = audioReactive.shapeResponse;
 
     dissolveUniformData.uProgress.value = baseProgress + (audio.bass * audioReactive.dissolveResponse);
