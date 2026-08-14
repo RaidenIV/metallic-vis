@@ -1967,6 +1967,11 @@ phyMat.side = THREE.DoubleSide;
 // Surface presets. Only appearance properties are touched — colour, side and
 // the dissolve shader injection stay under their existing controls. 'Metallic'
 // reproduces the original material exactly.
+const materialDefaults = {
+    dispersion: 0.0, iridescenceIOR: 1.3, iridescenceThicknessRange: [100, 400],
+    specularColor: 0xffffff,
+};
+
 const materialPresets = {
     'Metallic': {
         metalness: 2.0, roughness: 0.0, transmission: 0.0, thickness: 0.0,
@@ -1981,16 +1986,24 @@ const materialPresets = {
         attenuationDistance: Infinity, attenuationColor: 0xffffff,
     },
     'Liquid Glass': {
-        metalness: 0.0, roughness: 0.03, transmission: 1.0, thickness: 2.4,
-        ior: 1.45, iridescence: 0.35, clearcoat: 1.0, clearcoatRoughness: 0.02,
-        specularIntensity: 1.0, envMapIntensity: 1.4,
-        attenuationDistance: 6.0, attenuationColor: 0xdfefff,
+        metalness: 0.0, roughness: 0.02, transmission: 1.0, thickness: 3.4,
+        ior: 1.5, iridescence: 0.28, clearcoat: 1.0, clearcoatRoughness: 0.0,
+        specularIntensity: 1.0, envMapIntensity: 2.0,
+        attenuationDistance: 3.2, attenuationColor: 0xbfe3ff,
+        // Splits the refracted backdrop per channel — the single biggest
+        // readability win for thick glass against a busy environment.
+        dispersion: 0.18,
+        iridescenceIOR: 1.25, iridescenceThicknessRange: [120, 520],
+        specularColor: 0xffffff,
     },
     'Frosted Glass': {
-        metalness: 0.0, roughness: 0.42, transmission: 1.0, thickness: 3.0,
-        ior: 1.35, iridescence: 0.0, clearcoat: 0.35, clearcoatRoughness: 0.35,
-        specularIntensity: 1.0, envMapIntensity: 1.0,
-        attenuationDistance: 4.0, attenuationColor: 0xcfe4ff,
+        metalness: 0.0, roughness: 0.32, transmission: 1.0, thickness: 4.2,
+        ior: 1.42, iridescence: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.22,
+        specularIntensity: 1.0, envMapIntensity: 1.5,
+        attenuationDistance: 2.4, attenuationColor: 0xc2dcff,
+        dispersion: 0.05,
+        iridescenceIOR: 1.3, iridescenceThicknessRange: [100, 400],
+        specularColor: 0xffffff,
     },
     'Matte': {
         metalness: 0.1, roughness: 0.85, transmission: 0.0, thickness: 0.0,
@@ -2006,11 +2019,13 @@ function applyMaterialPreset(name) {
     const preset = materialPresets[name];
     if (!preset) return;
 
-    // transmission and iridescence toggle shader defines, so the program has to
-    // be rebuilt when a preset crosses zero in either direction.
+    // transmission, iridescence and dispersion each toggle a shader define, so
+    // the program has to be rebuilt when a preset crosses zero on any of them.
+    const nextDispersion = preset.dispersion ?? materialDefaults.dispersion;
     const needsRecompile =
         (phyMat.transmission > 0) !== (preset.transmission > 0) ||
-        (phyMat.iridescence > 0) !== (preset.iridescence > 0);
+        (phyMat.iridescence > 0) !== (preset.iridescence > 0) ||
+        (phyMat.dispersion > 0) !== (nextDispersion > 0);
 
     phyMat.metalness = preset.metalness;
     phyMat.roughness = preset.roughness;
@@ -2024,6 +2039,13 @@ function applyMaterialPreset(name) {
     phyMat.envMapIntensity = preset.envMapIntensity;
     phyMat.attenuationDistance = preset.attenuationDistance;
     phyMat.attenuationColor.set(preset.attenuationColor);
+
+    // Glass-only properties fall back to three's own defaults so a non-glass
+    // preset always clears whatever the previous one set.
+    phyMat.dispersion = nextDispersion;
+    phyMat.iridescenceIOR = preset.iridescenceIOR ?? materialDefaults.iridescenceIOR;
+    phyMat.iridescenceThicknessRange = [...(preset.iridescenceThicknessRange ?? materialDefaults.iridescenceThicknessRange)];
+    phyMat.specularColor.set(preset.specularColor ?? materialDefaults.specularColor);
 
     if (needsRecompile) phyMat.needsUpdate = true;
     currentMaterialName = name;
@@ -2152,10 +2174,16 @@ let particleCurrPosArr; // use to update he position of the particle
 let particleVelocityArr; // velocity of each particle
 let particleDistArr;
 let particleRotationArr;
+// Stable per-particle randoms. Keeping the raw values lets Lifetime and Count be
+// re-derived without reshuffling, so changing either never scrambles the swarm.
+let particleLifeRandArr;
+let particleSeedArr;
 let particleData = {
     particleSpeedFactor: 0.02, // for tweaking velocity 
     velocityFactor: { x: 2.5, y: 2 },
     waveAmplitude: 0,
+    particleCountRatio: 1,
+    particleLifetime: 1,
 }
 
 
@@ -2167,14 +2195,19 @@ function initParticleAttributes(meshGeo) {
     particleVelocityArr = new Float32Array(particleCount * 3);
     particleDistArr = new Float32Array(particleCount);
     particleRotationArr = new Float32Array(particleCount);
+    particleLifeRandArr = new Float32Array(particleCount);
+    particleSeedArr = new Float32Array(particleCount);
 
+    const lifetime = Math.max(0.05, Number(particleData.particleLifetime) || 1);
 
     for (let i = 0; i < particleCount; i++) {
         let x = i * 3 + 0;
         let y = i * 3 + 1;
         let z = i * 3 + 2;
 
-        particleMaxOffsetArr[i] = Math.random() * 5.5 + 1.5;
+        particleLifeRandArr[i] = Math.random();
+        particleSeedArr[i] = Math.random();
+        particleMaxOffsetArr[i] = (particleLifeRandArr[i] * 5.5 + 1.5) * lifetime;
 
         particleVelocityArr[x] = Math.random() * 0.5 + 0.5;
         particleVelocityArr[y] = Math.random() * 0.5 + 0.5;
@@ -2190,6 +2223,34 @@ function initParticleAttributes(meshGeo) {
     meshGeo.setAttribute('aVelocity', new THREE.BufferAttribute(particleVelocityArr, 3));
     meshGeo.setAttribute('aDist', new THREE.BufferAttribute(particleDistArr, 1).setUsage(THREE.DynamicDrawUsage));
     meshGeo.setAttribute('aAngle', new THREE.BufferAttribute(particleRotationArr, 1).setUsage(THREE.DynamicDrawUsage));
+    meshGeo.setAttribute('aSeed', new THREE.BufferAttribute(particleSeedArr, 1));
+}
+
+
+// Lifetime scales the reset distance. Re-deriving from the stored randoms keeps
+// each particle's relative range intact instead of redrawing the distribution.
+function applyParticleLifetime() {
+    if (!particleMaxOffsetArr || !particleLifeRandArr) return;
+    const lifetime = Math.max(0.05, Number(particleData.particleLifetime) || 1);
+    for (let i = 0; i < particleCount; i++) {
+        particleMaxOffsetArr[i] = (particleLifeRandArr[i] * 5.5 + 1.5) * lifetime;
+    }
+    const offsetAttribute = meshGeo?.getAttribute('aOffset');
+    if (offsetAttribute) offsetAttribute.needsUpdate = true;
+}
+
+
+// Count is expressed as a fraction of the mesh's vertices. Each particle owns a
+// fixed seed and is active while that seed falls under the ratio, so raising the
+// control adds particles without moving the ones already on screen.
+function getActiveParticleCount() {
+    if (!particleSeedArr) return 0;
+    const ratio = clamp(Number(particleData.particleCountRatio) || 0, 0, 1);
+    let active = 0;
+    for (let i = 0; i < particleCount; i++) {
+        if (particleSeedArr[i] <= ratio) active++;
+    }
+    return active;
 }
 
 
@@ -2198,8 +2259,13 @@ function updateParticleAttributes() {
     const velocityX = particleData.velocityFactor.x;
     const velocityY = particleData.velocityFactor.y;
     const waveAmplitude = particleData.waveAmplitude;
+    const countRatio = clamp(Number(particleData.particleCountRatio) || 0, 0, 1);
 
     for (let i = 0; i < particleCount; i++) {
+        // Hidden particles cost nothing: lowering Count is a real CPU saving,
+        // not just a visual mask.
+        if (particleSeedArr[i] > countRatio) continue;
+
         const x = i * 3;
         const y = x + 1;
         const z = x + 2;
@@ -2269,6 +2335,9 @@ const particlesUniformData = {
     uBaseSize: {
         value: isMobileDevice() ? 40 : 80,
     },
+    uCountRatio: {
+        value: particleData.particleCountRatio,
+    },
     uColor: {
         value: new THREE.Color(0x4d9bff),
     }
@@ -2288,16 +2357,21 @@ particleMat.vertexShader = `
     uniform float uProgress;
     uniform float uMotionAngle;
     uniform vec3 uMotionOffset;
+    uniform float uCountRatio;
 
     varying float vNoise;
     varying float vAngle;
+    varying float vActive;
 
     attribute vec3 aCurrentPos;
     attribute float aDist;
     attribute float aAngle;
+    attribute float aSeed;
 
     void main() {
         vec3 pos = position;
+
+        vActive = aSeed <= uCountRatio ? 1.0 : 0.0;
 
         // The mesh dissolve samples its noise through a rotated, tilted and
         // translated field. Reproduce that transform exactly here — sampling at
@@ -2337,7 +2411,7 @@ particleMat.vertexShader = `
 
         float size = uBaseSize * uPixelDensity;
         size = size  / (aDist + 1.0);
-        gl_PointSize = size / -viewPosition.z;
+        gl_PointSize = (size / -viewPosition.z) * vActive;
 }
 `;
 
@@ -2349,8 +2423,12 @@ particleMat.fragmentShader = `
 
     varying float vNoise;
     varying float vAngle;
+    varying float vActive;
 
     void main(){
+        // Some drivers clamp gl_PointSize up to 1.0, so the count gate is
+        // enforced here as well as in the vertex stage.
+        if( vActive < 0.5 ) discard;
         if( vNoise < uProgress ) discard;
         if( vNoise > uProgress + uEdge) discard;
 
@@ -2408,6 +2486,9 @@ let tweaks = {
     particleSpeedFactor: particleData.particleSpeedFactor,
     velocityFactor: particleData.velocityFactor,
     waveAmplitude: particleData.waveAmplitude,
+    particleCountPercent: particleData.particleCountRatio * 100,
+    particleLifetime: particleData.particleLifetime,
+    particleActiveCount: particleCount,
 
     bloomStrength: unrealBloomPass.strength,
     rotationY: mesh.rotation.y,
@@ -2453,6 +2534,7 @@ function handleMeshChange(geo, name = null) {
     scene.add(mesh);
     scene.add(particleMesh);
     if (name) currentMeshName = name;
+    syncParticleCountReadout();
 }
 
 
@@ -2730,6 +2812,8 @@ function collectSettings() {
             particleSpeedFactor: tweaks.particleSpeedFactor,
             velocityFactor: { ...particleData.velocityFactor },
             waveAmplitude: tweaks.waveAmplitude,
+            particleCountPercent: tweaks.particleCountPercent,
+            particleLifetime: tweaks.particleLifetime,
         },
         bloomStrength: tweaks.bloomStrength,
         rotationY: tweaks.rotationY,
@@ -2773,7 +2857,16 @@ async function applyImportedSettings(data) {
         particleData.particleSpeedFactor = tweaks.particleSpeedFactor;
         particleData.waveAmplitude = tweaks.waveAmplitude;
         if (data.particle.velocityFactor) Object.assign(particleData.velocityFactor, data.particle.velocityFactor);
+        if (Number.isFinite(data.particle.particleCountPercent)) {
+            particleData.particleCountRatio = clamp(tweaks.particleCountPercent / 100, 0, 1);
+            particlesUniformData.uCountRatio.value = particleData.particleCountRatio;
+        }
+        if (Number.isFinite(data.particle.particleLifetime)) {
+            particleData.particleLifetime = tweaks.particleLifetime;
+            applyParticleLifetime();
+        }
         particleMesh.visible = tweaks.particleVisible;
+        syncParticleCountReadout();
     }
     if (Number.isFinite(data.bloomStrength)) {
         tweaks.bloomStrength = data.bloomStrength;
@@ -2894,6 +2987,48 @@ async function startVideoExport() {
 fitViewport();
 window.addEventListener('resize', () => fitViewport());
 
+// Section defaults are captured once from the live initial state rather than
+// written out a second time, so a control's default and its reset value cannot
+// drift apart. Everything here is read after all module state is constructed.
+const sectionDefaults = {
+    audioReactive: { ...audioReactive },
+    audioFftSize: audioSettings.fftSize,
+    audioVolume: audioInfo.volume,
+    audioMuted: audioInfo.muted,
+    viewport: { ...viewportSettings },
+    camera: { ...cameraSettings },
+    background: currentBackgroundName,
+    meshName: geoNames[0],
+    materialName: currentMaterialName,
+    mesh: {
+        bloomStrength: tweaks.bloomStrength,
+        meshAutoRotate: tweaks.meshAutoRotate,
+        meshRotationSpeed: tweaks.meshRotationSpeed,
+        rotationY: tweaks.rotationY,
+    },
+    dissolve: {
+        meshVisible: tweaks.meshVisible,
+        dissolveProgress: tweaks.dissolveProgress,
+        autoDissolve: tweaks.autoDissolve,
+        edgeWidth: tweaks.edgeWidth,
+        frequency: tweaks.frequency,
+        amplitude: tweaks.amplitude,
+        meshColor: tweaks.meshColor,
+        edgeColor: tweaks.edgeColor,
+    },
+    particle: {
+        particleVisible: tweaks.particleVisible,
+        particleBaseSize: tweaks.particleBaseSize,
+        particleColor: tweaks.particleColor,
+        particleSpeedFactor: tweaks.particleSpeedFactor,
+        waveAmplitude: tweaks.waveAmplitude,
+        velocityFactor: { ...particleData.velocityFactor },
+        particleCountPercent: tweaks.particleCountPercent,
+        particleLifetime: tweaks.particleLifetime,
+    },
+    exportSettings: { ...exportSettings },
+};
+
 const controlsContainer = document.getElementById('controls');
 if (!controlsContainer) throw new Error('Controls container was not found.');
 
@@ -2904,6 +3039,13 @@ let rotationYBinding = null;
 // 'change', and the auto-rotate loop writes rotationY every frame.
 let suppressRotationYChange = false;
 let progressBinding = null;
+let particleActiveBinding = null;
+
+function syncParticleCountReadout() {
+    if (!tweaks) return;
+    tweaks.particleActiveCount = getActiveParticleCount();
+    if (particleActiveBinding) particleActiveBinding.refresh();
+}
 let fpsBinding = null;
 const performanceStats = { fps: 0 };
 let fpsFrameCount = 0;
@@ -2937,6 +3079,16 @@ async function initControls() {
             container: controlsContainer,
         });
         const controller = pane;
+        // Each section's reset pushes its defaults through the same setters the
+        // bindings use, then refreshes the pane via the guarded helper. List
+        // blades are not bindings, so refreshPane() cannot sync them — their
+        // values are assigned explicitly, which fires their own change handlers.
+        const addResetButton = (folder, apply) => {
+            folder.addButton({ title: 'Reset to Defaults' }).on('click', () => {
+                apply();
+                refreshPane();
+            });
+        };
         fpsBinding = controller.addBinding(performanceStats, 'fps', { label: 'FPS', readonly: true });
 
         const audioFolder = controller.addFolder({ title: 'Audio Source', expanded: true });
@@ -2982,6 +3134,10 @@ async function initControls() {
         );
         fftBlade.value = audioSettings.fftSize;
         fftBlade.on('change', (event) => setAudioResolution(event.value));
+        addResetButton(audioResolutionFolder, () => {
+            setAudioResolution(sectionDefaults.audioFftSize);
+            fftBlade.value = sectionDefaults.audioFftSize;
+        });
 
         audioFolder.addBinding(audioReactive, 'sensitivity', { min: 0.1, max: 4, step: 0.01, label: 'Sensitivity' });
         audioFolder.addBinding(audioReactive, 'smoothing', { min: 0, max: 0.95, step: 0.01, label: 'Smoothing' });
@@ -2992,6 +3148,11 @@ async function initControls() {
         reactivityFolder.addBinding(audioReactive, 'particleSizeResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Size' });
         reactivityFolder.addBinding(audioReactive, 'particleSpeedResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Speed' });
         reactivityFolder.addBinding(audioReactive, 'dissolveMotionResponse', { min: 0, max: 5, step: 0.01, label: 'Dissolve Motion' });
+        addResetButton(reactivityFolder, () => {
+            for (const key of ['lowMeshSizeResponse', 'bloomResponse', 'particleSizeResponse', 'particleSpeedResponse', 'dissolveMotionResponse']) {
+                audioReactive[key] = sectionDefaults.audioReactive[key];
+            }
+        });
 
         const frequencyFolder = audioFolder.addFolder({ title: 'Frequency Bands', expanded: false });
         frequencyFolder.addBinding(audioReactive, 'bassMinHz', { min: 20, max: 20000, step: 10, label: 'Low Min Hz' });
@@ -3000,6 +3161,21 @@ async function initControls() {
         frequencyFolder.addBinding(audioReactive, 'midsMaxHz', { min: 20, max: 20000, step: 10, label: 'Mids Max Hz' });
         frequencyFolder.addBinding(audioReactive, 'highsMinHz', { min: 20, max: 20000, step: 10, label: 'Highs Min Hz' });
         frequencyFolder.addBinding(audioReactive, 'highsMaxHz', { min: 20, max: 20000, step: 10, label: 'Highs Max Hz' });
+        addResetButton(frequencyFolder, () => {
+            for (const key of ['bassMinHz', 'bassMaxHz', 'midsMinHz', 'midsMaxHz', 'highsMinHz', 'highsMaxHz']) {
+                audioReactive[key] = sectionDefaults.audioReactive[key];
+            }
+        });
+
+        // Placed after the sub-folders so it renders at the end of Audio Source.
+        addResetButton(audioFolder, () => {
+            Object.assign(audioReactive, sectionDefaults.audioReactive);
+            setAudioResolution(sectionDefaults.audioFftSize);
+            fftBlade.value = sectionDefaults.audioFftSize;
+            audioInfo.volume = sectionDefaults.audioVolume;
+            audioInfo.muted = sectionDefaults.audioMuted;
+            applyAudioOutputGain();
+        });
 
         const viewportFolder = controller.addFolder({ title: 'Viewport', expanded: false });
         const viewportBlade = createTweakList(viewportFolder, 'Format', Object.keys(viewportAspects), Object.keys(viewportAspects));
@@ -3007,6 +3183,9 @@ async function initControls() {
         viewportBlade.on('change', (event) => {
             viewportSettings.format = event.value;
             fitViewport();
+        });
+        addResetButton(viewportFolder, () => {
+            viewportBlade.value = sectionDefaults.viewport.format;
         });
 
         const cameraFolder = controller.addFolder({ title: 'Camera', expanded: false });
@@ -3028,11 +3207,19 @@ async function initControls() {
         cameraFolder.addBinding(cameraSettings, 'mouseControls', { label: 'Mouse Controls' });
         cameraFolder.addBinding(cameraSettings, 'damping', { label: 'Damping' });
         cameraFolder.addButton({ title: 'Center Visualization' }).on('click', () => centerVisualization());
+        addResetButton(cameraFolder, () => {
+            Object.assign(cameraSettings, sectionDefaults.camera);
+            cameraPresetBlade.value = sectionDefaults.camera.preset;
+            cameraSettingsDirty = true;
+        });
 
         const backgroundFolder = controller.addFolder({ title: 'Background', expanded: false });
         const backgroundBlade = createTweakList(backgroundFolder, 'Background', backgroundNames, backgroundNames);
         backgroundBlade.value = currentBackgroundName;
         backgroundBlade.on('change', (event) => { void loadBackground(event.value); });
+        addResetButton(backgroundFolder, () => {
+            backgroundBlade.value = sectionDefaults.background;
+        });
 
         const meshFolder = controller.addFolder({ title: 'Mesh', expanded: false });
         meshBlade = createTweakList(meshFolder, 'Mesh', geoNames, geometries);
@@ -3053,6 +3240,13 @@ async function initControls() {
             if (suppressRotationYChange) return;
             particleMesh.rotation.y = mesh.rotation.y = event.value;
         });
+        addResetButton(meshFolder, () => {
+            meshBlade.value = geometries[geoNames.indexOf(sectionDefaults.meshName)];
+            materialBlade.value = sectionDefaults.materialName;
+            Object.assign(tweaks, sectionDefaults.mesh);
+            unrealBloomPass.strength = tweaks.bloomStrength;
+            particleMesh.rotation.y = mesh.rotation.y = tweaks.rotationY;
+        });
 
         const dissolveFolder = controller.addFolder({ title: 'Dissolve Effect', expanded: false });
         dissolveFolder.addBinding(tweaks, 'meshVisible', { label: 'Visible' }).on('change', (event) => { mesh.visible = event.value; });
@@ -3063,6 +3257,16 @@ async function initControls() {
         dissolveFolder.addBinding(tweaks, 'amplitude', { min: 0.1, max: 20, step: 0.001, label: 'Amplitude' }).on('change', (event) => { dissolveUniformData.uAmp.value = event.value; });
         dissolveFolder.addBinding(tweaks, 'meshColor', { label: 'Mesh Color' }).on('change', (event) => { phyMat.color.set(event.value); });
         dissolveFolder.addBinding(tweaks, 'edgeColor', { label: 'Edge Color' }).on('change', (event) => { dissolveUniformData.uEdgeColor.value.set(event.value); });
+        addResetButton(dissolveFolder, () => {
+            Object.assign(tweaks, sectionDefaults.dissolve);
+            dissolveUniformData.uProgress.value = tweaks.dissolveProgress;
+            dissolveUniformData.uEdge.value = tweaks.edgeWidth;
+            dissolveUniformData.uFreq.value = tweaks.frequency;
+            dissolveUniformData.uAmp.value = tweaks.amplitude;
+            dissolveUniformData.uEdgeColor.value.set(tweaks.edgeColor);
+            phyMat.color.set(tweaks.meshColor);
+            mesh.visible = tweaks.meshVisible;
+        });
 
         const particleFolder = controller.addFolder({ title: 'Particle Motion', expanded: false });
         particleFolder.addBinding(tweaks, 'particleVisible', { label: 'Visible' }).on('change', (event) => { particleMesh.visible = event.value; });
@@ -3071,6 +3275,32 @@ async function initControls() {
         particleFolder.addBinding(tweaks, 'particleSpeedFactor', { min: 0.001, max: 0.1, step: 0.001, label: 'Speed' }).on('change', (event) => { particleData.particleSpeedFactor = event.value; });
         particleFolder.addBinding(tweaks, 'waveAmplitude', { min: 0, max: 5, step: 0.01, label: 'Wave Amplitude' }).on('change', (event) => { particleData.waveAmplitude = event.value; });
         particleFolder.addBinding(tweaks, 'velocityFactor', { expanded: true, picker: 'inline', label: 'Velocity Factor' }).on('change', (event) => { particleData.velocityFactor = event.value; });
+        particleFolder.addBinding(tweaks, 'particleCountPercent', { min: 0, max: 100, step: 1, label: 'Count %' }).on('change', (event) => {
+            particleData.particleCountRatio = clamp(event.value / 100, 0, 1);
+            particlesUniformData.uCountRatio.value = particleData.particleCountRatio;
+            syncParticleCountReadout();
+        });
+        particleActiveBinding = particleFolder.addBinding(tweaks, 'particleActiveCount', { label: 'Particles', readonly: true, format: (value) => Math.round(value).toLocaleString() });
+        particleFolder.addBinding(tweaks, 'particleLifetime', { min: 0.05, max: 5, step: 0.01, label: 'Lifetime' }).on('change', (event) => {
+            particleData.particleLifetime = event.value;
+            applyParticleLifetime();
+        });
+        addResetButton(particleFolder, () => {
+            Object.assign(tweaks, sectionDefaults.particle);
+            tweaks.velocityFactor = { ...sectionDefaults.particle.velocityFactor };
+            particlesUniformData.uBaseSize.value = tweaks.particleBaseSize;
+            particlesUniformData.uColor.value.set(tweaks.particleColor);
+            particleData.particleSpeedFactor = tweaks.particleSpeedFactor;
+            particleData.waveAmplitude = tweaks.waveAmplitude;
+            particleData.velocityFactor = tweaks.velocityFactor;
+            particleData.particleCountRatio = clamp(tweaks.particleCountPercent / 100, 0, 1);
+            particlesUniformData.uCountRatio.value = particleData.particleCountRatio;
+            particleData.particleLifetime = tweaks.particleLifetime;
+            applyParticleLifetime();
+            particleMesh.visible = tweaks.particleVisible;
+            syncParticleCountReadout();
+        });
+        syncParticleCountReadout();
 
         const exportFolder = controller.addFolder({ title: 'Export', expanded: false });
         exportFolder.addBinding(exportSettings, 'fileName', { label: 'File Name' });
@@ -3091,6 +3321,13 @@ async function initControls() {
         exportFolder.addButton({ title: 'Export JSON' }).on('click', () => exportJson());
         exportFolder.addButton({ title: 'Import JSON' }).on('click', () => importJsonInput.click());
         exportFolder.addBinding(exportSettings, 'status', { label: 'Status', readonly: true });
+        addResetButton(exportFolder, () => {
+            Object.assign(exportSettings, sectionDefaults.exportSettings);
+            exportResolutionBlade.value = exportSettings.resolution;
+            exportFpsBlade.value = exportSettings.frameRate;
+            exportBitrateBlade.value = exportSettings.bitrateMbps;
+            exportTypeBlade.value = exportSettings.videoType;
+        });
     } catch (error) {
         console.error('Controls failed to initialize.', error);
         controlsContainer.textContent = 'Controls failed to load. Refresh the page to retry.';
@@ -3267,4 +3504,3 @@ window.addEventListener('orientationchange', () => {
     fitViewport();
     cameraSettingsDirty = true;
 });
-
