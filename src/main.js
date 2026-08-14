@@ -4,8 +4,9 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { AudioEngine } from './audio.js';
-import { createMetalSphere } from './sphere.js';
+import { applyMetalPreset, createMetalSphere } from './sphere.js';
 import { createUI, DEFAULT_PRESET } from './ui.js';
 
 const canvas = document.getElementById('visualizer');
@@ -18,6 +19,23 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = DEFAULT_PRESET.exposure;
 
 const scene = new THREE.Scene();
+
+const pmremGenerator = new THREE.PMREMGenerator(renderer);
+pmremGenerator.compileEquirectangularShader();
+const roomEnvironment = new RoomEnvironment();
+const environmentTarget = pmremGenerator.fromScene(roomEnvironment, 0.04);
+scene.environment = environmentTarget.texture;
+pmremGenerator.dispose();
+if (typeof roomEnvironment.dispose === 'function') roomEnvironment.dispose();
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.6);
+keyLight.position.set(-4.5, 5.5, 6.5);
+scene.add(keyLight);
+
+const rimLight = new THREE.DirectionalLight(0xb8d5ff, 1.35);
+rimLight.position.set(5.5, 0.8, -4.0);
+scene.add(rimLight);
+
 const camera = new THREE.PerspectiveCamera(DEFAULT_PRESET.fov, window.innerWidth / window.innerHeight, 0.1, 100);
 camera.position.set(0, 0, DEFAULT_PRESET.cameraDistance);
 
@@ -30,7 +48,7 @@ controls.maxDistance = 15;
 controls.autoRotate = DEFAULT_PRESET.autoRotate;
 controls.autoRotateSpeed = DEFAULT_PRESET.rotateSpeed;
 
-const { mesh: sphere, uniforms } = createMetalSphere();
+const { mesh: sphere, material, uniforms } = createMetalSphere();
 scene.add(sphere);
 
 const composer = new EffectComposer(renderer);
@@ -48,13 +66,22 @@ let suppressSeek = false;
 
 function applyParam(id, value) {
   params[id] = value;
-  const map = {
-    radius: 'uRadius', deformation: 'uDeformation', noiseScale: 'uNoiseScale', noiseSpeed: 'uNoiseSpeed',
-    surfaceDetail: 'uSurfaceDetail', metalness: 'uMetalness', roughness: 'uRoughness', reflection: 'uReflection',
-    propagationSpeed: 'uPropagationSpeed', propagationWidth: 'uPropagationWidth', propagationMode: 'uPropagationMode'
-  };
-  if (map[id]) uniforms[map[id]].value = value;
 
+  const uniformMap = {
+    deformation: 'uDeformation',
+    noiseScale: 'uNoiseScale',
+    noiseSpeed: 'uNoiseSpeed',
+    surfaceDetail: 'uSurfaceDetail',
+    propagationSpeed: 'uPropagationSpeed',
+    propagationWidth: 'uPropagationWidth',
+    propagationMode: 'uPropagationMode'
+  };
+  if (uniformMap[id]) uniforms[uniformMap[id]].value = value;
+
+  if (id === 'metalType') applyMetalPreset(material, value);
+  if (id === 'metalness') material.metalness = value;
+  if (id === 'roughness') material.roughness = value;
+  if (id === 'reflection') material.envMapIntensity = value;
   if (id === 'sensitivity') audio.sensitivity = value;
   if (id === 'smoothing') audio.setSmoothing(value);
   if (id === 'bloomEnabled') bloom.enabled = value;
@@ -206,7 +233,9 @@ function animate() {
   uniforms.uTreble.value = trebleSmooth;
   uniforms.uLevel.value = levelSmooth;
   uniforms.uBeat.value = bands.beat;
-  uniforms.uCameraPosition.value.copy(camera.position);
+
+  const audioRadius = 1 + Math.max(0, levelSmooth * 0.024 + bassSmooth * 0.012 + bands.beat * 0.018) * params.deformation;
+  sphere.scale.setScalar(params.radius * audioRadius);
 
   sphere.rotation.y += dt * 0.035;
   sphere.rotation.x = Math.sin(t * 0.12) * 0.055;
@@ -224,4 +253,9 @@ function resize() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 }
 window.addEventListener('resize', resize);
-window.addEventListener('beforeunload', () => audio.dispose());
+window.addEventListener('beforeunload', () => {
+  audio.dispose();
+  environmentTarget.dispose();
+  sphere.geometry.dispose();
+  material.dispose();
+});

@@ -4,6 +4,8 @@ const numericControls = [
   'exposure','cameraDistance','fov','rotateSpeed'
 ];
 
+const stringControls = new Set(['metalType']);
+
 export const DEFAULT_PRESET = {
   sensitivity: 1.35,
   smoothing: 0.82,
@@ -15,6 +17,7 @@ export const DEFAULT_PRESET = {
   noiseScale: 2.60,
   noiseSpeed: 0.22,
   surfaceDetail: 0.18,
+  metalType: 'platinum',
   metalness: 1.0,
   roughness: 0.18,
   reflection: 1.80,
@@ -38,6 +41,12 @@ function formatValue(id, value) {
   return Number(value).toFixed(2);
 }
 
+function controlValue(id, el) {
+  if (el.type === 'checkbox') return el.checked;
+  if (stringControls.has(id)) return el.value;
+  return Number(el.value);
+}
+
 export function createUI(onChange) {
   const els = {};
   numericControls.forEach(id => {
@@ -56,6 +65,9 @@ export function createUI(onChange) {
     els[id].addEventListener('change', () => onChange(id, els[id].checked));
   });
 
+  els.metalType = document.getElementById('metalType');
+  els.metalType.addEventListener('change', () => onChange('metalType', els.metalType.value));
+
   els.propagationMode = document.getElementById('propagationMode');
   els.propagationMode.addEventListener('change', () => onChange('propagationMode', Number(els.propagationMode.value)));
 
@@ -70,7 +82,7 @@ export function createUI(onChange) {
       else el.value = value;
       const output = document.getElementById(`${id}Value`);
       if (output) output.value = formatValue(id, Number(value));
-      onChange(id, el.type === 'checkbox' ? el.checked : (el.tagName === 'SELECT' || el.type === 'range' ? Number(el.value) : el.value));
+      onChange(id, controlValue(id, el));
     });
   }
 
@@ -79,7 +91,7 @@ export function createUI(onChange) {
     Object.keys(DEFAULT_PRESET).forEach(id => {
       const el = document.getElementById(id);
       if (!el) return;
-      preset[id] = el.type === 'checkbox' ? el.checked : Number(el.value);
+      preset[id] = controlValue(id, el);
     });
     return preset;
   }
