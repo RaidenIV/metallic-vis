@@ -250,6 +250,7 @@ const audioReactive = {
     lowMeshSizeResponse: 0.45,
     bloomResponse: 1.5,
     particleSizeResponse: 1.25,
+    dissolveMotionResponse: 0,
 };
 
 const audioSettings = {
@@ -815,6 +816,9 @@ const dissolveUniformData = {
     },
     uEdge: {
         value: 0.8
+    },
+    uMotionAngle: {
+        value: 0.0
     }
 }
 
@@ -845,6 +849,7 @@ function setupDissolveShader(shader) {
         uniform float uAmp;
         uniform float uProgress;
         uniform float uEdge;
+        uniform float uMotionAngle;
         uniform vec3 uEdgeColor;
 
         ${snoise}
@@ -853,7 +858,14 @@ function setupDissolveShader(shader) {
     // fragment shader snippet inside main
     shader.fragmentShader = shader.fragmentShader.replace('#include <dithering_fragment>', `#include <dithering_fragment>
 
-        float noise = snoise(vPos * uFreq) * uAmp; // calculate snoise in fragment shader for smooth dissolve edges
+        float motionCos = cos(uMotionAngle);
+        float motionSin = sin(uMotionAngle);
+        vec3 movingNoisePos = vec3(
+            motionCos * vPos.x - motionSin * vPos.z,
+            vPos.y,
+            motionSin * vPos.x + motionCos * vPos.z
+        );
+        float noise = snoise(movingNoisePos * uFreq) * uAmp; // rotate the dissolve field around the mesh without changing dissolve progress
 
         if(noise < uProgress) discard; // discard any fragment where noise is lower than progress
 
@@ -1709,6 +1721,7 @@ async function initControls() {
         reactivityFolder.addBinding(audioReactive, 'lowMeshSizeResponse', { min: 0, max: 1.5, step: 0.01, label: 'Low → Mesh Size' });
         reactivityFolder.addBinding(audioReactive, 'bloomResponse', { min: 0, max: 5, step: 0.01, label: 'Bloom' });
         reactivityFolder.addBinding(audioReactive, 'particleSizeResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Size' });
+        reactivityFolder.addBinding(audioReactive, 'dissolveMotionResponse', { min: 0, max: 5, step: 0.01, label: 'Dissolve Motion' });
 
         const frequencyFolder = audioFolder.addFolder({ title: 'Frequency Bands', expanded: false });
         frequencyFolder.addBinding(audioReactive, 'bassMinHz', { min: 20, max: 20000, step: 10, label: 'Low Min Hz' });
@@ -1844,8 +1857,13 @@ function floatMeshes(time) {
 
 
 const clock = new THREE.Clock();
+let dissolveMotionPhase = 0;
+let previousAnimationTime = performance.now();
 function animate() {
     let time = clock.getElapsedTime();
+    const animationNow = performance.now();
+    const animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
+    previousAnimationTime = animationNow;
 
     animateDissolve();
 
@@ -1855,6 +1873,14 @@ function animate() {
     const baseParticleSize = particlesUniformData.uBaseSize.value;
     const baseBloomStrength = unrealBloomPass.strength;
     const audio = readAudioLevels();
+
+    // Move the existing dissolve pattern around the mesh without changing the
+    // dissolve threshold. The phase only advances when audio magnitude exists,
+    // so silence leaves the pattern stationary.
+    if (audioReactive.dissolveMotionResponse > 0 && audio.level > 0) {
+        dissolveMotionPhase += audio.level * audioReactive.dissolveMotionResponse * animationDelta * 2.5;
+    }
+    dissolveUniformData.uMotionAngle.value = dissolveMotionPhase;
 
     if (loopSettings.enabled && !audioElement.paused && Number.isFinite(audioElement.duration) && audioElement.duration > 0) {
         const loopStart = Math.max(0, Math.min(audioElement.duration, loopSettings.start));
