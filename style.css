@@ -41,7 +41,7 @@ body {
   top: 12px;
   right: 12px;
   z-index: 10001;
-  width: min(320px, calc(100vw - 24px));
+  width: min(384px, calc(100vw - 24px));
   pointer-events: auto;
 }
 
@@ -109,10 +109,14 @@ body {
 }
 
 /* Added controls can exceed the viewport height; keep the panel usable without
-   changing the canvas or existing visual styling. */
+   changing the canvas or existing visual styling. The vertical scrollbar used
+   to eat into the content box and push the panel into a horizontal scroll, so
+   reserve its gutter and clamp the horizontal axis. */
 .control-panel {
   max-height: calc(100vh - 24px);
   overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
   overscroll-behavior: contain;
 }
 
