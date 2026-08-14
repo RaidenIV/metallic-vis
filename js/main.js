@@ -253,6 +253,7 @@ const audioReactive = {
     lowMeshSizeResponse: 0.45,
     bloomResponse: 1.5,
     particleSizeResponse: 1.25,
+    particleSpeedResponse: 1.0,
     dissolveMotionResponse: 0,
 };
 
@@ -2261,6 +2262,10 @@ const particlesUniformData = {
     uEdge: dissolveUniformData.uEdge,
     uAmp: dissolveUniformData.uAmp,
     uFreq: dissolveUniformData.uFreq,
+    // Same uniform objects the mesh dissolve uses, so the particle band samples
+    // an identical noise field rather than a static one.
+    uMotionAngle: dissolveUniformData.uMotionAngle,
+    uMotionOffset: dissolveUniformData.uMotionOffset,
     uBaseSize: {
         value: isMobileDevice() ? 40 : 80,
     },
@@ -2281,6 +2286,8 @@ particleMat.vertexShader = `
     uniform float uAmp;
     uniform float uEdge;
     uniform float uProgress;
+    uniform float uMotionAngle;
+    uniform vec3 uMotionOffset;
 
     varying float vNoise;
     varying float vAngle;
@@ -2292,7 +2299,29 @@ particleMat.vertexShader = `
     void main() {
         vec3 pos = position;
 
-        float noise = snoise(pos * uFreq) * uAmp;
+        // The mesh dissolve samples its noise through a rotated, tilted and
+        // translated field. Reproduce that transform exactly here — sampling at
+        // the untransformed rest position left the particle band pinned to a
+        // static field while the mesh edge travelled, so the two drifted apart.
+        float motionCos = cos(uMotionAngle);
+        float motionSin = sin(uMotionAngle);
+        vec3 rotatedNoisePos = vec3(
+            motionCos * pos.x - motionSin * pos.z,
+            pos.y,
+            motionSin * pos.x + motionCos * pos.z
+        );
+
+        float tiltAngle = uMotionAngle * 0.73;
+        float tiltCos = cos(tiltAngle);
+        float tiltSin = sin(tiltAngle);
+        vec3 tiltedNoisePos = vec3(
+            rotatedNoisePos.x,
+            tiltCos * rotatedNoisePos.y - tiltSin * rotatedNoisePos.z,
+            tiltSin * rotatedNoisePos.y + tiltCos * rotatedNoisePos.z
+        );
+        vec3 movingNoisePos = tiltedNoisePos + uMotionOffset;
+
+        float noise = snoise(movingNoisePos * uFreq) * uAmp;
         vNoise =noise;
 
         vAngle = aAngle;
@@ -2961,6 +2990,7 @@ async function initControls() {
         reactivityFolder.addBinding(audioReactive, 'lowMeshSizeResponse', { min: 0, max: 1.5, step: 0.01, label: 'Low → Mesh Size' });
         reactivityFolder.addBinding(audioReactive, 'bloomResponse', { min: 0, max: 5, step: 0.01, label: 'Bloom' });
         reactivityFolder.addBinding(audioReactive, 'particleSizeResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Size' });
+        reactivityFolder.addBinding(audioReactive, 'particleSpeedResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Speed' });
         reactivityFolder.addBinding(audioReactive, 'dissolveMotionResponse', { min: 0, max: 5, step: 0.01, label: 'Dissolve Motion' });
 
         const frequencyFolder = audioFolder.addFolder({ title: 'Frequency Bands', expanded: false });
@@ -3137,6 +3167,7 @@ function animate() {
     // control values: lows scale the mesh, while mids/highs drive bloom and
     // particle sprite size. Silence returns every audio-driven value to baseline.
     const baseParticleSize = particlesUniformData.uBaseSize.value;
+    const baseParticleSpeed = particleData.particleSpeedFactor;
     const baseBloomStrength = Math.max(0, Number(tweaks.bloomStrength) || 0);
     const audio = readAudioLevels();
 
@@ -3184,6 +3215,9 @@ function animate() {
     // the edge itself becomes a stronger bloom source as mids/highs rise.
     dissolveUniformData.uEdgeBloomBoost.value = 1 + reactiveBloomAmount;
     particlesUniformData.uBaseSize.value = baseParticleSize * (1 + midHighMagnitude * audioReactive.particleSizeResponse);
+    // Overall level drives how fast particles travel away from the surface, so
+    // the swarm accelerates with the track and settles back in silence.
+    particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.level * audioReactive.particleSpeedResponse);
 
     updateCameraMotion(time, audio);
 
@@ -3211,6 +3245,7 @@ function animate() {
 
     // Restore baseline values so audio reactivity never rewrites user controls.
     particlesUniformData.uBaseSize.value = baseParticleSize;
+    particleData.particleSpeedFactor = baseParticleSpeed;
     unrealBloomPass.strength = baseBloomStrength;
     dissolveUniformData.uEdgeBloomBoost.value = 1;
 
