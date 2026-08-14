@@ -298,10 +298,13 @@ const backgroundPresets = {
     'Tantolunden': { type: 'cube', prefix: new URL('../assets/backgrounds/Tantolunden/', import.meta.url).href, postfix: '.jpg' },
     'Vindelalven': { type: 'cube', prefix: new URL('../assets/backgrounds/Vindelalven/', import.meta.url).href, postfix: '.jpg' },
     'Yokohama 3': { type: 'cube', prefix: new URL('../assets/backgrounds/Yokohama3/', import.meta.url).href, postfix: '.jpg' },
+    'Milky Way': { type: 'equirect', url: new URL('../assets/backgrounds/8k_stars_milky_way.jpg', import.meta.url).href },
+    'Stars': { type: 'equirect', url: new URL('../assets/backgrounds/8k_stars.jpg', import.meta.url).href },
 };
 const backgroundNames = Object.keys(backgroundPresets);
 const backgroundTextureCache = new Map();
 let defaultEnvironmentTexture = null;
+let activeBackgroundTexture = null;
 
 
 async function loadBackground(name) {
@@ -315,6 +318,9 @@ async function loadBackground(name) {
             texture = await new THREE.CubeTextureLoader().loadAsync(cubeTextureUrls);
         } else {
             texture = await new THREE.TextureLoader().loadAsync(preset.url);
+            if (preset.type === 'equirect') {
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+            }
         }
         texture.colorSpace = THREE.SRGBColorSpace;
         backgroundTextureCache.set(name, texture);
@@ -324,9 +330,12 @@ async function loadBackground(name) {
         defaultEnvironmentTexture = texture;
     }
 
+    activeBackgroundTexture = texture;
     scene.background = texture;
     if (preset.type === 'cube') {
         cubeTexture = texture;
+        scene.environment = texture;
+    } else if (preset.type === 'equirect') {
         scene.environment = texture;
     } else {
         scene.environment = defaultEnvironmentTexture || cubeTexture;
@@ -937,7 +946,7 @@ function animate() {
     scene.background = blackColor;
     effectComposer1.render();
 
-    scene.background = cubeTexture;
+    scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
     // Restore the original control values after rendering so the audio layer is
