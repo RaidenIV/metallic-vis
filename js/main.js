@@ -105,7 +105,7 @@ scene.background = blackColor;
 
 
 const re = new THREE.WebGLRenderer({ canvas: cnvs, antialias: true });
-re.setPixelRatio(window.devicePixelRatio);
+re.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 re.setSize(cnvs.clientWidth * scale, cnvs.clientHeight * scale, false);
 re.toneMapping = THREE.CineonToneMapping;
 re.outputColorSpace = THREE.SRGBColorSpace;
@@ -114,7 +114,7 @@ re.outputColorSpace = THREE.SRGBColorSpace;
 const effectComposer1 = new EffectComposer(re);
 const renderPass = new RenderPass(scene, cam);
 let radius = isMobileDevice() ? 0.1 : 0.25;
-const unrealBloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerHeight * scale, window.innerWidth * scale), 0.5, radius, 0.2);
+const unrealBloomPass = new UnrealBloomPass(new THREE.Vector2(cnvs.clientWidth * scale, cnvs.clientHeight * scale), 0.5, radius, 0.2);
 const outPass = new OutputPass();
 
 const effectComposer2 = new EffectComposer(re);
@@ -242,19 +242,17 @@ let audioObjectUrl = null;
 const audioReactive = {
     sensitivity: 1.35,
     smoothing: 0.78,
-    shapeResponse: 0.9,
-    bassShapeResponse: 1.0,
-    midsShapeResponse: 1.0,
-    highsShapeResponse: 1.0,
     bassMinHz: 20,
     bassMaxHz: 180,
     midsMinHz: 180,
     midsMaxHz: 2200,
     highsMinHz: 2200,
     highsMaxHz: 12000,
-    dissolveResponse: 4.5,
-    particleResponse: 2.0,
-    bloomResponse: 1.8,
+    lowMeshSizeResponse: 0.45,
+    midsBloomResponse: 1.2,
+    highsBloomResponse: 1.8,
+    midsParticleSizeResponse: 1.0,
+    highsParticleSizeResponse: 1.5,
 };
 
 function ensureAudioAnalyser() {
@@ -291,13 +289,11 @@ function getBandLevel(minHz, maxHz) {
 
 function readAudioLevels() {
     if (!audioAnalyser || !audioFrequencyData || audioElement.paused) {
-        clearMeshSpectrum();
         return { bass: 0, mids: 0, highs: 0, level: 0 };
     }
 
     audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
     audioAnalyser.getByteFrequencyData(audioFrequencyData);
-    updateMeshSpectrum();
 
     const sensitivity = audioReactive.sensitivity;
     const bassMin = Math.min(audioReactive.bassMinHz, audioReactive.bassMaxHz);
@@ -497,28 +493,6 @@ const cube = new THREE.BoxGeometry(7.2, 7.2, 7.2, boxSegments, boxSegments, boxS
 const cylinder = new THREE.CylinderGeometry(3.5, 3.5, 7.0, radialSegments, heightSegments, false);
 const cone = new THREE.ConeGeometry(4.0, 7.5, radialSegments, heightSegments, false);
 
-function addFrequencyCoordinates(geometry) {
-    const position = geometry.getAttribute('position');
-    const coords = new Float32Array(position.count);
-
-    geometry.computeBoundingBox();
-    const box = geometry.boundingBox;
-    const minY = box?.min.y ?? -1;
-    const maxY = box?.max.y ?? 1;
-    const yRange = Math.max(0.0001, maxY - minY);
-
-    for (let i = 0; i < position.count; i++) {
-        const x = position.getX(i);
-        const y = position.getY(i);
-        const z = position.getZ(i);
-        const azimuth = (Math.atan2(z, x) + Math.PI) / (Math.PI * 2);
-        const vertical = (y - minY) / yRange;
-        coords[i] = (azimuth * 0.78 + vertical * 0.22) % 1;
-    }
-
-    geometry.setAttribute('aFrequencyCoord', new THREE.BufferAttribute(coords, 1));
-}
-
 let geoNames = [
     "Sphere",
     "TorusKnot",
@@ -544,7 +518,6 @@ let geometries = [
     cone,
 ];
 
-geometries.forEach(addFrequencyCoordinates);
 
 
 let particleTexture;
@@ -580,60 +553,6 @@ const dissolveUniformData = {
     }
 }
 
-const meshSpectrumSize = 512;
-const meshSpectrumData = new Uint8Array(meshSpectrumSize);
-const meshSpectrumTexture = new THREE.DataTexture(
-    meshSpectrumData,
-    meshSpectrumSize,
-    1,
-    THREE.RedFormat,
-    THREE.UnsignedByteType
-);
-meshSpectrumTexture.minFilter = THREE.LinearFilter;
-meshSpectrumTexture.magFilter = THREE.LinearFilter;
-meshSpectrumTexture.wrapS = THREE.ClampToEdgeWrapping;
-meshSpectrumTexture.wrapT = THREE.ClampToEdgeWrapping;
-meshSpectrumTexture.generateMipmaps = false;
-meshSpectrumTexture.needsUpdate = true;
-
-function clearMeshSpectrum() {
-    meshSpectrumData.fill(0);
-    meshSpectrumTexture.needsUpdate = true;
-}
-
-function updateMeshSpectrum() {
-    if (!audioFrequencyData || audioElement.paused) {
-        clearMeshSpectrum();
-        return;
-    }
-
-    const sourceLength = audioFrequencyData.length;
-    for (let i = 0; i < meshSpectrumSize; i++) {
-        const sourceIndex = Math.min(sourceLength - 1, Math.floor((i / (meshSpectrumSize - 1)) * (sourceLength - 1)));
-        meshSpectrumData[i] = audioFrequencyData[sourceIndex];
-    }
-    meshSpectrumTexture.needsUpdate = true;
-}
-
-const shapeUniformData = {
-    uAudioSpectrum: { value: meshSpectrumTexture },
-    uAudioNyquist: { value: 24000 },
-    uAudioSensitivity: { value: audioReactive.sensitivity },
-    uSpectrumMinHz: { value: audioReactive.bassMinHz },
-    uSpectrumMaxHz: { value: audioReactive.highsMaxHz },
-    uBassMinHz: { value: audioReactive.bassMinHz },
-    uBassMaxHz: { value: audioReactive.bassMaxHz },
-    uMidsMinHz: { value: audioReactive.midsMinHz },
-    uMidsMaxHz: { value: audioReactive.midsMaxHz },
-    uHighsMinHz: { value: audioReactive.highsMinHz },
-    uHighsMaxHz: { value: audioReactive.highsMaxHz },
-    uShapeBass: { value: audioReactive.bassShapeResponse },
-    uShapeMids: { value: audioReactive.midsShapeResponse },
-    uShapeHighs: { value: audioReactive.highsShapeResponse },
-    uShapeStrength: { value: audioReactive.shapeResponse },
-};
-
-
 function setupUniforms(shader, uniforms) {
     const keys = Object.keys(uniforms);
     for (let i = 0; i < keys.length; i++) {
@@ -643,50 +562,13 @@ function setupUniforms(shader, uniforms) {
 }
 
 function setupDissolveShader(shader) {
-    // Each vertex is assigned a stable position in the FFT spectrum. Its
-    // displacement is the current magnitude of that exact frequency region, so
-    // there is no procedural or time-driven mesh motion when the audio is quiet.
+    // Keep the original mesh geometry intact. Audio now changes the mesh size
+    // uniformly from low-frequency magnitude rather than distorting vertices.
     shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>
         varying vec3 vPos;
-
-        attribute float aFrequencyCoord;
-        uniform sampler2D uAudioSpectrum;
-        uniform float uAudioNyquist;
-        uniform float uAudioSensitivity;
-        uniform float uSpectrumMinHz;
-        uniform float uSpectrumMaxHz;
-        uniform float uBassMinHz;
-        uniform float uBassMaxHz;
-        uniform float uMidsMinHz;
-        uniform float uMidsMaxHz;
-        uniform float uHighsMinHz;
-        uniform float uHighsMaxHz;
-        uniform float uShapeBass;
-        uniform float uShapeMids;
-        uniform float uShapeHighs;
-        uniform float uShapeStrength;
     `);
 
     shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
-        vec3 shapeNormal = normalize(normal);
-        float mappedHz = mix(uSpectrumMinHz, uSpectrumMaxHz, aFrequencyCoord);
-        float spectrumU = clamp(mappedHz / max(uAudioNyquist, 1.0), 0.0, 1.0);
-        float magnitude = texture2D(uAudioSpectrum, vec2(spectrumU, 0.5)).r;
-        magnitude = clamp(magnitude * uAudioSensitivity, 0.0, 1.0);
-
-        float bandWeight = 0.0;
-        if (mappedHz >= uBassMinHz && mappedHz <= uBassMaxHz) {
-            bandWeight += uShapeBass;
-        }
-        if (mappedHz >= uMidsMinHz && mappedHz <= uMidsMaxHz) {
-            bandWeight += uShapeMids;
-        }
-        if (mappedHz >= uHighsMinHz && mappedHz <= uHighsMaxHz) {
-            bandWeight += uShapeHighs;
-        }
-
-        float shapeOffset = uShapeStrength * magnitude * bandWeight;
-        transformed += shapeNormal * shapeOffset;
         vPos = transformed;
     `);
 
@@ -724,7 +606,6 @@ function setupDissolveShader(shader) {
 
 phyMat.onBeforeCompile = (shader) => {
     setupUniforms(shader, dissolveUniformData);
-    setupUniforms(shader, shapeUniformData);
     setupDissolveShader(shader);
 }
 
@@ -778,77 +659,50 @@ function initParticleAttributes(meshGeo) {
     }
 
     meshGeo.setAttribute('aOffset', new THREE.BufferAttribute(particleMaxOffsetArr, 1));
-    meshGeo.setAttribute('aCurrentPos', new THREE.BufferAttribute(particleCurrPosArr, 3));
+    meshGeo.setAttribute('aCurrentPos', new THREE.BufferAttribute(particleCurrPosArr, 3).setUsage(THREE.DynamicDrawUsage));
     meshGeo.setAttribute('aVelocity', new THREE.BufferAttribute(particleVelocityArr, 3));
-    meshGeo.setAttribute('aDist', new THREE.BufferAttribute(particleDistArr, 1));
-    meshGeo.setAttribute('aAngle', new THREE.BufferAttribute(particleRotationArr, 1));
+    meshGeo.setAttribute('aDist', new THREE.BufferAttribute(particleDistArr, 1).setUsage(THREE.DynamicDrawUsage));
+    meshGeo.setAttribute('aAngle', new THREE.BufferAttribute(particleRotationArr, 1).setUsage(THREE.DynamicDrawUsage));
 }
 
 
-function calculateWaveOffset(idx) {
+function updateParticleAttributes() {
+    const speed = Math.abs(particleData.particleSpeedFactor);
+    const velocityX = particleData.velocityFactor.x;
+    const velocityY = particleData.velocityFactor.y;
+    const waveAmplitude = particleData.waveAmplitude;
 
-    const posx = particleCurrPosArr[idx * 3 + 0];
-    const posy = particleCurrPosArr[idx * 3 + 1];
-
-    let xwave1 = Math.sin(posy * 2) * (0.8 + particleData.waveAmplitude);
-    let ywave1 = Math.sin(posx * 2) * (0.6 + particleData.waveAmplitude);
-
-    let xwave2 = Math.sin(posy * 5) * (0.2 + particleData.waveAmplitude);
-    let ywave2 = Math.sin(posx * 1) * (0.9 + particleData.waveAmplitude);
-
-
-    let xwave3 = Math.sin(posy * 8) * (0.8 + particleData.waveAmplitude);
-    let ywave3 = Math.sin(posx * 5) * (0.6 + particleData.waveAmplitude);
-
-
-    let xwave4 = Math.sin(posy * 3) * (0.8 + particleData.waveAmplitude);
-    let ywave4 = Math.sin(posx * 7) * (0.6 + particleData.waveAmplitude);
-
-    let xwave = xwave1 + xwave2 + xwave3 + xwave4;
-    let ywave = ywave1 + ywave2 + ywave3 + ywave4;
-
-    return { xwave, ywave }
-}
-
-
-function updateVelocity(idx) {
-
-    let vx = particleVelocityArr[idx * 3 + 0];
-    let vy = particleVelocityArr[idx * 3 + 1];
-    let vz = particleVelocityArr[idx * 3 + 2];
-
-    vx *= particleData.velocityFactor.x;
-    vy *= particleData.velocityFactor.y;
-
-    let { xwave, ywave } = calculateWaveOffset(idx);
-
-    vx += xwave;
-    vy += ywave;
-
-
-    vx *= Math.abs(particleData.particleSpeedFactor);
-    vy *= Math.abs(particleData.particleSpeedFactor);
-    vz *= Math.abs(particleData.particleSpeedFactor);
-
-    return { vx, vy, vz }
-}
-
-
-function updateParticleAttriutes() {
     for (let i = 0; i < particleCount; i++) {
-        let x = i * 3 + 0;
-        let y = i * 3 + 1;
-        let z = i * 3 + 2;
+        const x = i * 3;
+        const y = x + 1;
+        const z = x + 2;
 
-        let { vx, vy, vz } = updateVelocity(i);
+        const posx = particleCurrPosArr[x];
+        const posy = particleCurrPosArr[y];
+
+        const xwave =
+            Math.sin(posy * 2) * (0.8 + waveAmplitude) +
+            Math.sin(posy * 5) * (0.2 + waveAmplitude) +
+            Math.sin(posy * 8) * (0.8 + waveAmplitude) +
+            Math.sin(posy * 3) * (0.8 + waveAmplitude);
+        const ywave =
+            Math.sin(posx * 2) * (0.6 + waveAmplitude) +
+            Math.sin(posx) * (0.9 + waveAmplitude) +
+            Math.sin(posx * 5) * (0.6 + waveAmplitude) +
+            Math.sin(posx * 7) * (0.6 + waveAmplitude);
+
+        const vx = (particleVelocityArr[x] * velocityX + xwave) * speed;
+        const vy = (particleVelocityArr[y] * velocityY + ywave) * speed;
+        const vz = particleVelocityArr[z] * speed;
 
         particleCurrPosArr[x] += vx;
         particleCurrPosArr[y] += vy;
         particleCurrPosArr[z] += vz;
 
-        const vec1 = new THREE.Vector3(particleInitPosArr[x], particleInitPosArr[y], particleInitPosArr[z]);
-        const vec2 = new THREE.Vector3(particleCurrPosArr[x], particleCurrPosArr[y], particleCurrPosArr[z]);
-        const dist = vec1.distanceTo(vec2);
+        const dx = particleCurrPosArr[x] - particleInitPosArr[x];
+        const dy = particleCurrPosArr[y] - particleInitPosArr[y];
+        const dz = particleCurrPosArr[z] - particleInitPosArr[z];
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
         particleDistArr[i] = dist;
         particleRotationArr[i] += 0.01;
@@ -857,14 +711,13 @@ function updateParticleAttriutes() {
             particleCurrPosArr[x] = particleInitPosArr[x];
             particleCurrPosArr[y] = particleInitPosArr[y];
             particleCurrPosArr[z] = particleInitPosArr[z];
+            particleDistArr[i] = 0.001;
         }
     }
 
-    meshGeo.setAttribute('aOffset', new THREE.BufferAttribute(particleMaxOffsetArr, 1));
-    meshGeo.setAttribute('aCurrentPos', new THREE.BufferAttribute(particleCurrPosArr, 3));
-    meshGeo.setAttribute('aVelocity', new THREE.BufferAttribute(particleVelocityArr, 3));
-    meshGeo.setAttribute('aDist', new THREE.BufferAttribute(particleDistArr, 1));
-    meshGeo.setAttribute('aAngle', new THREE.BufferAttribute(particleRotationArr, 1));
+    meshGeo.getAttribute('aCurrentPos').needsUpdate = true;
+    meshGeo.getAttribute('aDist').needsUpdate = true;
+    meshGeo.getAttribute('aAngle').needsUpdate = true;
 }
 
 
@@ -1001,7 +854,7 @@ let tweaks = {
     velocityFactor: particleData.velocityFactor,
     waveAmplitude: particleData.waveAmplitude,
 
-    bloomStrength: shaderPass.uniforms.uStrength.value,
+    bloomStrength: unrealBloomPass.strength,
     rotationY: mesh.rotation.y,
 };
 
@@ -1047,29 +900,31 @@ const pane = new Pane({
 });
 const controller = pane;
 
+const performanceStats = { fps: 0 };
+const fpsBinding = controller.addBinding(performanceStats, "fps", { label: "FPS", readonly: true });
+let fpsFrameCount = 0;
+let fpsSampleStart = performance.now();
+
 const audioFolder = controller.addFolder({ title: "Audio", expanded: true });
 audioFolder.addButton({ title: "Load Audio" }).on('click', () => audioFileInput.click());
 audioFolder.addButton({ title: "Play / Pause" }).on('click', () => { void toggleAudioPlayback(); });
 audioFolder.addBinding(audioReactive, "sensitivity", { min: 0.1, max: 4, step: 0.01, label: "Sensitivity" });
 audioFolder.addBinding(audioReactive, "smoothing", { min: 0, max: 0.95, step: 0.01, label: "Smoothing" });
 
-const distortionFolder = audioFolder.addFolder({ title: "Mesh Distortion", expanded: true });
-distortionFolder.addBinding(audioReactive, "shapeResponse", { min: 0, max: 2.5, step: 0.01, label: "Amount" });
-distortionFolder.addBinding(audioReactive, "bassShapeResponse", { min: 0, max: 3, step: 0.01, label: "Bass" });
-distortionFolder.addBinding(audioReactive, "midsShapeResponse", { min: 0, max: 3, step: 0.01, label: "Mids" });
-distortionFolder.addBinding(audioReactive, "highsShapeResponse", { min: 0, max: 3, step: 0.01, label: "Highs" });
+const reactivityFolder = audioFolder.addFolder({ title: "Reactivity", expanded: true });
+reactivityFolder.addBinding(audioReactive, "lowMeshSizeResponse", { min: 0, max: 1.5, step: 0.01, label: "Low → Mesh Size" });
+reactivityFolder.addBinding(audioReactive, "midsBloomResponse", { min: 0, max: 5, step: 0.01, label: "Mids → Bloom" });
+reactivityFolder.addBinding(audioReactive, "highsBloomResponse", { min: 0, max: 5, step: 0.01, label: "Highs → Bloom" });
+reactivityFolder.addBinding(audioReactive, "midsParticleSizeResponse", { min: 0, max: 5, step: 0.01, label: "Mids → Particle Size" });
+reactivityFolder.addBinding(audioReactive, "highsParticleSizeResponse", { min: 0, max: 5, step: 0.01, label: "Highs → Particle Size" });
 
 const frequencyFolder = audioFolder.addFolder({ title: "Frequency Bands", expanded: false });
-frequencyFolder.addBinding(audioReactive, "bassMinHz", { min: 20, max: 20000, step: 10, label: "Bass Low Hz" });
-frequencyFolder.addBinding(audioReactive, "bassMaxHz", { min: 20, max: 20000, step: 10, label: "Bass High Hz" });
-frequencyFolder.addBinding(audioReactive, "midsMinHz", { min: 20, max: 20000, step: 10, label: "Mids Low Hz" });
-frequencyFolder.addBinding(audioReactive, "midsMaxHz", { min: 20, max: 20000, step: 10, label: "Mids High Hz" });
-frequencyFolder.addBinding(audioReactive, "highsMinHz", { min: 20, max: 20000, step: 10, label: "Highs Low Hz" });
-frequencyFolder.addBinding(audioReactive, "highsMaxHz", { min: 20, max: 20000, step: 10, label: "Highs High Hz" });
-
-audioFolder.addBinding(audioReactive, "dissolveResponse", { min: 0, max: 10, step: 0.01, label: "Dissolve" });
-audioFolder.addBinding(audioReactive, "particleResponse", { min: 0, max: 5, step: 0.01, label: "Particles" });
-audioFolder.addBinding(audioReactive, "bloomResponse", { min: 0, max: 5, step: 0.01, label: "Bloom" });
+frequencyFolder.addBinding(audioReactive, "bassMinHz", { min: 20, max: 20000, step: 10, label: "Low Min Hz" });
+frequencyFolder.addBinding(audioReactive, "bassMaxHz", { min: 20, max: 20000, step: 10, label: "Low Max Hz" });
+frequencyFolder.addBinding(audioReactive, "midsMinHz", { min: 20, max: 20000, step: 10, label: "Mids Min Hz" });
+frequencyFolder.addBinding(audioReactive, "midsMaxHz", { min: 20, max: 20000, step: 10, label: "Mids Max Hz" });
+frequencyFolder.addBinding(audioReactive, "highsMinHz", { min: 20, max: 20000, step: 10, label: "Highs Min Hz" });
+frequencyFolder.addBinding(audioReactive, "highsMaxHz", { min: 20, max: 20000, step: 10, label: "Highs Max Hz" });
 
 
 const backgroundFolder = controller.addFolder({ title: "Background", expanded: false });
@@ -1080,7 +935,7 @@ backgroundBlade.on('change', (event) => { void loadBackground(event.value); });
 const meshFolder = controller.addFolder({ title: "Mesh", expanded: false });
 let meshBlade = createTweakList(meshFolder, 'Mesh', geoNames, geometries);
 meshBlade.on('change', (val) => { handleMeshChange(val.value) });
-meshFolder.addBinding(tweaks, "bloomStrength", { min: 1, max: 20, step: 0.01, label: "Bloom Strength" }).on('change', (obj) => { shaderPass.uniforms.uStrength.value = obj.value; })
+meshFolder.addBinding(tweaks, "bloomStrength", { min: 0, max: 5, step: 0.01, label: "Bloom Strength" }).on('change', (obj) => { unrealBloomPass.strength = obj.value; })
 meshFolder.addBinding(tweaks, "rotationY", { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: "Rotation Y" }).on('change', (obj) => { particleMesh.rotation.y = mesh.rotation.y = obj.value; });
 
 
@@ -1143,49 +998,28 @@ function animate() {
 
     animateDissolve();
 
-    // Keep the existing tweak values as the baseline and temporarily layer audio
-    // response on top for this frame. This avoids audio permanently overwriting
-    // any of the original controls.
-    const baseProgress = dissolveUniformData.uProgress.value;
-    const baseEdge = dissolveUniformData.uEdge.value;
-    const baseParticleSpeed = particleData.particleSpeedFactor;
-    const baseWaveAmplitude = particleData.waveAmplitude;
-    const baseBloomStrength = shaderPass.uniforms.uStrength.value;
-
+    // Apply the requested frequency mapping without changing the underlying
+    // control values: lows scale the mesh, while mids/highs drive bloom and
+    // particle sprite size. Silence returns every audio-driven value to baseline.
+    const baseParticleSize = particlesUniformData.uBaseSize.value;
+    const baseBloomStrength = unrealBloomPass.strength;
     const audio = readAudioLevels();
 
-    // Mesh deformation samples the live FFT texture per vertex. The Bass/Mids/Highs
-    // controls are response weights only; the actual displacement comes entirely
-    // from the magnitude of the frequency assigned to that vertex.
-    const bassMin = Math.min(audioReactive.bassMinHz, audioReactive.bassMaxHz);
-    const bassMax = Math.max(audioReactive.bassMinHz, audioReactive.bassMaxHz);
-    const midsMin = Math.min(audioReactive.midsMinHz, audioReactive.midsMaxHz);
-    const midsMax = Math.max(audioReactive.midsMinHz, audioReactive.midsMaxHz);
-    const highsMin = Math.min(audioReactive.highsMinHz, audioReactive.highsMaxHz);
-    const highsMax = Math.max(audioReactive.highsMinHz, audioReactive.highsMaxHz);
+    const meshScale = 1 + audio.bass * audioReactive.lowMeshSizeResponse;
+    mesh.scale.setScalar(meshScale);
+    particleMesh.scale.setScalar(meshScale);
 
-    shapeUniformData.uAudioNyquist.value = audioContext ? audioContext.sampleRate / 2 : 24000;
-    shapeUniformData.uAudioSensitivity.value = audioReactive.sensitivity;
-    shapeUniformData.uSpectrumMinHz.value = Math.min(bassMin, midsMin, highsMin);
-    shapeUniformData.uSpectrumMaxHz.value = Math.max(bassMax, midsMax, highsMax);
-    shapeUniformData.uBassMinHz.value = bassMin;
-    shapeUniformData.uBassMaxHz.value = bassMax;
-    shapeUniformData.uMidsMinHz.value = midsMin;
-    shapeUniformData.uMidsMaxHz.value = midsMax;
-    shapeUniformData.uHighsMinHz.value = highsMin;
-    shapeUniformData.uHighsMaxHz.value = highsMax;
-    shapeUniformData.uShapeBass.value = audioReactive.bassShapeResponse;
-    shapeUniformData.uShapeMids.value = audioReactive.midsShapeResponse;
-    shapeUniformData.uShapeHighs.value = audioReactive.highsShapeResponse;
-    shapeUniformData.uShapeStrength.value = audioReactive.shapeResponse;
+    const bloomGain =
+        audio.mids * audioReactive.midsBloomResponse +
+        audio.highs * audioReactive.highsBloomResponse;
+    unrealBloomPass.strength = baseBloomStrength * (1 + bloomGain);
 
-    dissolveUniformData.uProgress.value = baseProgress + (audio.bass * audioReactive.dissolveResponse);
-    dissolveUniformData.uEdge.value = baseEdge * (1 + audio.highs * 0.6);
-    particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.mids * audioReactive.particleResponse);
-    particleData.waveAmplitude = baseWaveAmplitude + (audio.bass * audioReactive.particleResponse);
-    shaderPass.uniforms.uStrength.value = baseBloomStrength * (1 + audio.level * audioReactive.bloomResponse);
+    const particleSizeGain =
+        audio.mids * audioReactive.midsParticleSizeResponse +
+        audio.highs * audioReactive.highsParticleSizeResponse;
+    particlesUniformData.uBaseSize.value = baseParticleSize * (1 + particleSizeGain);
 
-    updateParticleAttriutes();
+    updateParticleAttributes();
 
     floatMeshes(time);
 
@@ -1202,13 +1036,19 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
-    // Restore the original control values after rendering so the audio layer is
-    // non-destructive and Auto Animate continues to operate exactly as before.
-    dissolveUniformData.uProgress.value = baseProgress;
-    dissolveUniformData.uEdge.value = baseEdge;
-    particleData.particleSpeedFactor = baseParticleSpeed;
-    particleData.waveAmplitude = baseWaveAmplitude;
-    shaderPass.uniforms.uStrength.value = baseBloomStrength;
+    // Restore baseline values so audio reactivity never rewrites user controls.
+    particlesUniformData.uBaseSize.value = baseParticleSize;
+    unrealBloomPass.strength = baseBloomStrength;
+
+    fpsFrameCount++;
+    const now = performance.now();
+    const fpsElapsed = now - fpsSampleStart;
+    if (fpsElapsed >= 500) {
+        performanceStats.fps = Math.round((fpsFrameCount * 1000) / fpsElapsed);
+        fpsBinding.refresh();
+        fpsFrameCount = 0;
+        fpsSampleStart = now;
+    }
 
     requestAnimationFrame(animate);
 }
