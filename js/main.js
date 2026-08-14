@@ -164,6 +164,64 @@ const orbCtrls = new OrbitControls(cam, cnvs);
 //document.body.appendChild(stat.dom);
 
 
+const loadProgressUi = {
+    background: {
+        panel: document.getElementById('background-load-progress'),
+        label: document.getElementById('background-load-label'),
+        percent: document.getElementById('background-load-percent'),
+        fill: document.getElementById('background-load-fill'),
+        hideTimer: null,
+    },
+    audio: {
+        panel: document.getElementById('audio-load-progress'),
+        label: document.getElementById('audio-load-label'),
+        percent: document.getElementById('audio-load-percent'),
+        fill: document.getElementById('audio-load-fill'),
+        hideTimer: null,
+    },
+};
+
+function updateLoadProgress(kind, progress, label) {
+    const ui = loadProgressUi[kind];
+    if (!ui?.panel || !ui.label || !ui.percent || !ui.fill) return;
+
+    if (ui.hideTimer) {
+        clearTimeout(ui.hideTimer);
+        ui.hideTimer = null;
+    }
+
+    const value = Math.max(0, Math.min(1, Number.isFinite(progress) ? progress : 0));
+    const percent = Math.round(value * 100);
+    ui.panel.hidden = false;
+    if (label) ui.label.textContent = label;
+    ui.percent.textContent = `${percent}%`;
+    ui.fill.style.width = `${percent}%`;
+}
+
+function completeLoadProgress(kind, label) {
+    const ui = loadProgressUi[kind];
+    updateLoadProgress(kind, 1, label);
+    if (!ui?.panel) return;
+    ui.hideTimer = setTimeout(() => {
+        ui.panel.hidden = true;
+        ui.hideTimer = null;
+    }, 550);
+}
+
+function failLoadProgress(kind, label) {
+    const ui = loadProgressUi[kind];
+    if (!ui?.panel || !ui.label || !ui.percent) return;
+    if (ui.hideTimer) clearTimeout(ui.hideTimer);
+    ui.panel.hidden = false;
+    ui.label.textContent = label;
+    ui.percent.textContent = 'ERROR';
+    ui.hideTimer = setTimeout(() => {
+        ui.panel.hidden = true;
+        ui.hideTimer = null;
+    }, 1800);
+}
+
+
 // Audio-reactive layer. The selected file stays local to the browser and is
 // analysed with the Web Audio API; the original visual effect remains intact.
 const audioElement = new Audio();
@@ -185,6 +243,15 @@ const audioReactive = {
     sensitivity: 1.35,
     smoothing: 0.78,
     shapeResponse: 0.9,
+    bassShapeResponse: 1.0,
+    midsShapeResponse: 1.0,
+    highsShapeResponse: 1.0,
+    bassMinHz: 20,
+    bassMaxHz: 180,
+    midsMinHz: 180,
+    midsMaxHz: 2200,
+    highsMinHz: 2200,
+    highsMaxHz: 12000,
     dissolveResponse: 4.5,
     particleResponse: 2.0,
     bloomResponse: 1.8,
@@ -231,9 +298,16 @@ function readAudioLevels() {
     audioAnalyser.getByteFrequencyData(audioFrequencyData);
 
     const sensitivity = audioReactive.sensitivity;
-    const bass = Math.min(1, getBandLevel(20, 180) * sensitivity);
-    const mids = Math.min(1, getBandLevel(180, 2200) * sensitivity);
-    const highs = Math.min(1, getBandLevel(2200, 12000) * sensitivity);
+    const bassMin = Math.min(audioReactive.bassMinHz, audioReactive.bassMaxHz);
+    const bassMax = Math.max(audioReactive.bassMinHz, audioReactive.bassMaxHz);
+    const midsMin = Math.min(audioReactive.midsMinHz, audioReactive.midsMaxHz);
+    const midsMax = Math.max(audioReactive.midsMinHz, audioReactive.midsMaxHz);
+    const highsMin = Math.min(audioReactive.highsMinHz, audioReactive.highsMaxHz);
+    const highsMax = Math.max(audioReactive.highsMinHz, audioReactive.highsMaxHz);
+
+    const bass = Math.min(1, getBandLevel(bassMin, bassMax) * sensitivity);
+    const mids = Math.min(1, getBandLevel(midsMin, midsMax) * sensitivity);
+    const highs = Math.min(1, getBandLevel(highsMin, highsMax) * sensitivity);
     const level = Math.min(1, ((bass * 0.5) + (mids * 0.3) + (highs * 0.2)));
 
     return { bass, mids, highs, level };
@@ -256,14 +330,40 @@ audioFileInput.addEventListener('change', async () => {
     const file = audioFileInput.files?.[0];
     if (!file) return;
 
-    if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
-    audioObjectUrl = URL.createObjectURL(file);
-    audioElement.src = audioObjectUrl;
-    audioElement.load();
+    const progressLabel = `Audio · ${file.name}`;
+    updateLoadProgress('audio', 0, progressLabel);
 
-    ensureAudioAnalyser();
-    if (audioContext?.state === 'suspended') await audioContext.resume();
-    await audioElement.play();
+    try {
+        // Read the local file once so the progress bar reflects actual bytes read.
+        // Playback still uses a local object URL and nothing is uploaded.
+        await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.addEventListener('progress', (event) => {
+                if (event.lengthComputable && event.total > 0) {
+                    updateLoadProgress('audio', event.loaded / event.total, progressLabel);
+                }
+            });
+            reader.addEventListener('load', resolve, { once: true });
+            reader.addEventListener('error', () => reject(reader.error || new Error('Audio file read failed.')), { once: true });
+            reader.addEventListener('abort', () => reject(new Error('Audio file read was cancelled.')), { once: true });
+            reader.readAsArrayBuffer(file);
+        });
+
+        if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+        audioObjectUrl = URL.createObjectURL(file);
+        audioElement.src = audioObjectUrl;
+        audioElement.load();
+
+        ensureAudioAnalyser();
+        if (audioContext?.state === 'suspended') await audioContext.resume();
+        completeLoadProgress('audio', progressLabel);
+        await audioElement.play();
+    } catch (error) {
+        console.error(error);
+        failLoadProgress('audio', 'Audio load failed');
+    } finally {
+        audioFileInput.value = '';
+    }
 });
 
 
@@ -311,38 +411,59 @@ async function loadBackground(name) {
     const preset = backgroundPresets[name];
     if (!preset) return;
 
+    const progressLabel = `Background · ${name}`;
     let texture = backgroundTextureCache.get(name);
-    if (!texture) {
-        if (preset.type === 'cube') {
-            cubeTextureUrls = generateCubeUrls(preset.prefix, preset.postfix);
-            texture = await new THREE.CubeTextureLoader().loadAsync(cubeTextureUrls);
-        } else {
-            texture = await new THREE.TextureLoader().loadAsync(preset.url);
-            if (preset.type === 'equirect') {
-                texture.mapping = THREE.EquirectangularReflectionMapping;
+
+    try {
+        if (!texture) {
+            updateLoadProgress('background', 0, progressLabel);
+
+            const manager = new THREE.LoadingManager();
+            manager.onProgress = (_url, itemsLoaded, itemsTotal) => {
+                if (itemsTotal > 0) {
+                    updateLoadProgress('background', itemsLoaded / itemsTotal, progressLabel);
+                }
+            };
+            manager.onError = () => {
+                failLoadProgress('background', `Background failed · ${name}`);
+            };
+
+            if (preset.type === 'cube') {
+                cubeTextureUrls = generateCubeUrls(preset.prefix, preset.postfix);
+                texture = await new THREE.CubeTextureLoader(manager).loadAsync(cubeTextureUrls);
+            } else {
+                texture = await new THREE.TextureLoader(manager).loadAsync(preset.url);
+                if (preset.type === 'equirect') {
+                    texture.mapping = THREE.EquirectangularReflectionMapping;
+                }
             }
+            texture.colorSpace = THREE.SRGBColorSpace;
+            backgroundTextureCache.set(name, texture);
+            completeLoadProgress('background', progressLabel);
         }
-        texture.colorSpace = THREE.SRGBColorSpace;
-        backgroundTextureCache.set(name, texture);
-    }
 
-    if (name === 'Original' && preset.type === 'cube' && !defaultEnvironmentTexture) {
-        defaultEnvironmentTexture = texture;
-    }
+        if (name === 'Original' && preset.type === 'cube' && !defaultEnvironmentTexture) {
+            defaultEnvironmentTexture = texture;
+        }
 
-    activeBackgroundTexture = texture;
-    scene.background = texture;
-    if (preset.type === 'cube') {
-        cubeTexture = texture;
-        scene.environment = texture;
-    } else if (preset.type === 'equirect') {
-        scene.environment = texture;
-    } else {
-        scene.environment = defaultEnvironmentTexture || cubeTexture;
-    }
+        activeBackgroundTexture = texture;
+        scene.background = texture;
+        if (preset.type === 'cube') {
+            cubeTexture = texture;
+            scene.environment = texture;
+        } else if (preset.type === 'equirect') {
+            scene.environment = texture;
+        } else {
+            scene.environment = defaultEnvironmentTexture || cubeTexture;
+        }
 
-    cubeCamera.update(re, scene);
-    document.body.classList.remove("loading");
+        cubeCamera.update(re, scene);
+        document.body.classList.remove("loading");
+    } catch (error) {
+        console.error(error);
+        failLoadProgress('background', `Background failed · ${name}`);
+        document.body.classList.remove("loading");
+    }
 }
 
 
@@ -829,7 +950,21 @@ audioFolder.addButton({ title: "Load Audio" }).on('click', () => audioFileInput.
 audioFolder.addButton({ title: "Play / Pause" }).on('click', () => { void toggleAudioPlayback(); });
 audioFolder.addBinding(audioReactive, "sensitivity", { min: 0.1, max: 4, step: 0.01, label: "Sensitivity" });
 audioFolder.addBinding(audioReactive, "smoothing", { min: 0, max: 0.95, step: 0.01, label: "Smoothing" });
-audioFolder.addBinding(audioReactive, "shapeResponse", { min: 0, max: 2.5, step: 0.01, label: "Shape" });
+
+const distortionFolder = audioFolder.addFolder({ title: "Mesh Distortion", expanded: true });
+distortionFolder.addBinding(audioReactive, "shapeResponse", { min: 0, max: 2.5, step: 0.01, label: "Amount" });
+distortionFolder.addBinding(audioReactive, "bassShapeResponse", { min: 0, max: 3, step: 0.01, label: "Bass" });
+distortionFolder.addBinding(audioReactive, "midsShapeResponse", { min: 0, max: 3, step: 0.01, label: "Mids" });
+distortionFolder.addBinding(audioReactive, "highsShapeResponse", { min: 0, max: 3, step: 0.01, label: "Highs" });
+
+const frequencyFolder = audioFolder.addFolder({ title: "Frequency Bands", expanded: false });
+frequencyFolder.addBinding(audioReactive, "bassMinHz", { min: 20, max: 20000, step: 10, label: "Bass Low Hz" });
+frequencyFolder.addBinding(audioReactive, "bassMaxHz", { min: 20, max: 20000, step: 10, label: "Bass High Hz" });
+frequencyFolder.addBinding(audioReactive, "midsMinHz", { min: 20, max: 20000, step: 10, label: "Mids Low Hz" });
+frequencyFolder.addBinding(audioReactive, "midsMaxHz", { min: 20, max: 20000, step: 10, label: "Mids High Hz" });
+frequencyFolder.addBinding(audioReactive, "highsMinHz", { min: 20, max: 20000, step: 10, label: "Highs Low Hz" });
+frequencyFolder.addBinding(audioReactive, "highsMaxHz", { min: 20, max: 20000, step: 10, label: "Highs High Hz" });
+
 audioFolder.addBinding(audioReactive, "dissolveResponse", { min: 0, max: 10, step: 0.01, label: "Dissolve" });
 audioFolder.addBinding(audioReactive, "particleResponse", { min: 0, max: 5, step: 0.01, label: "Particles" });
 audioFolder.addBinding(audioReactive, "bloomResponse", { min: 0, max: 5, step: 0.01, label: "Bloom" });
@@ -920,9 +1055,9 @@ function animate() {
     // Shape reactivity is evaluated in the metallic material's vertex shader.
     // Bass creates broad traveling bulges, mids create organic surface waves,
     // and highs add fine vibration. All displacement follows the vertex normal.
-    shapeUniformData.uShapeBass.value = audio.bass;
-    shapeUniformData.uShapeMids.value = audio.mids;
-    shapeUniformData.uShapeHighs.value = audio.highs;
+    shapeUniformData.uShapeBass.value = audio.bass * audioReactive.bassShapeResponse;
+    shapeUniformData.uShapeMids.value = audio.mids * audioReactive.midsShapeResponse;
+    shapeUniformData.uShapeHighs.value = audio.highs * audioReactive.highsShapeResponse;
     shapeUniformData.uShapeTime.value = time;
     shapeUniformData.uShapeStrength.value = audioReactive.shapeResponse;
 

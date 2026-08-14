@@ -16,27 +16,29 @@
     </script>
   </head>
   <body class="loading">
-    <header class="site-header">
-      <div class="site-header__inner">
-        <h1>Dissolve Effect</h1>
-        <nav class="site-nav" aria-label="Project links">
-          <a href="https://tympanus.net/codrops/?p=">Tutorial</a>
-          <a href="https://github.com/JatinChopra/emissive-dissolve-effect">GitHub</a>
-          <a href="https://tympanus.net/codrops/demos/">All demos</a>
-        </nav>
-      </div>
-    </header>
-
     <canvas id="c"></canvas>
     <div id="controls" class="control-panel" aria-label="Visualizer controls"></div>
 
-    <footer class="site-footer">
-      <nav class="tag-nav" aria-label="Tags">
-        <a href="https://tympanus.net/codrops/demos/?tag=glsl">#glsl</a>
-        <a href="https://tympanus.net/codrops/demos/?tag=three-js">#three.js</a>
-        <a href="https://tympanus.net/codrops/demos/?tag=webgl">#webgl</a>
-      </nav>
-    </footer>
+    <div class="load-progress-stack" aria-live="polite" aria-atomic="true">
+      <div id="background-load-progress" class="load-progress" hidden>
+        <div class="load-progress__meta">
+          <span id="background-load-label">Background</span>
+          <span id="background-load-percent">0%</span>
+        </div>
+        <div class="load-progress__track" aria-hidden="true">
+          <div id="background-load-fill" class="load-progress__fill"></div>
+        </div>
+      </div>
+      <div id="audio-load-progress" class="load-progress" hidden>
+        <div class="load-progress__meta">
+          <span id="audio-load-label">Audio</span>
+          <span id="audio-load-percent">0%</span>
+        </div>
+        <div class="load-progress__track" aria-hidden="true">
+          <div id="audio-load-fill" class="load-progress__fill"></div>
+        </div>
+      </div>
+    </div>
 
     <script type="module" src="./js/main.js"></script>
   </body>
