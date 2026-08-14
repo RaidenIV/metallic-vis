@@ -221,24 +221,31 @@ function failLoadProgress(kind, label) {
 }
 
 
-// Audio-reactive layer. The selected file stays local to the browser and is
-// analysed with the Web Audio API; the original visual effect remains intact.
+// Audio-reactive layer. The selected file stays local to the browser.
+// Playback intentionally remains on the native HTMLAudioElement path used by
+// the Boid reference project. Visualization data is analyzed offline from the
+// decoded AudioBuffer, so the audible signal is never routed through an
+// AnalyserNode/MediaElementSourceNode and volume/mute cannot change reactivity.
+const audioElement = new Audio();
+audioElement.preload = 'auto';
+
 const audioFileInput = document.createElement('input');
 audioFileInput.type = 'file';
 audioFileInput.accept = 'audio/*';
 audioFileInput.hidden = true;
 document.body.appendChild(audioFileInput);
 
-let audioContext = null;
 let decodeAudioContext = null;
-let audioAnalyser = null;
-let audioOutputGain = null;
-let audioFrequencyData = null;
-let transportSource = null;
-let transportIsPlaying = false;
-let transportOffset = 0;
-let transportStartedAt = 0;
-let transportStartedOffset = 0;
+let audioObjectUrl = null;
+let decodedAudioBuffer = null;
+let audioAnalysis = null;
+let audioAnalysisVersion = 0;
+let audioReanalysisTimer = null;
+
+const ANALYSIS_FPS = 60;
+const MAX_ANALYSIS_FRAMES = 24000;
+const MIN_DECIBELS = -100;
+const MAX_DECIBELS = -30;
 
 const audioReactive = {
     sensitivity: 1.35,
@@ -283,8 +290,6 @@ const loopSettings = {
     snapToBeats: true,
 };
 
-let decodedAudioBuffer = null;
-let recordingDestination = null;
 let audioInfoBindings = [];
 let seekBinding = null;
 let loopBindings = [];
@@ -321,255 +326,305 @@ function getDecodeAudioContext() {
 }
 
 function applyAudioOutputGain() {
-    if (!audioOutputGain || !audioContext) return;
-    const volume = Math.max(0, Math.min(1, Number(audioInfo.volume) / 100));
-    const gain = audioInfo.muted ? 0 : volume;
-    audioOutputGain.gain.setValueAtTime(gain, audioContext.currentTime);
+    // Native playback only. Analysis is precomputed from decoded PCM, so these
+    // user-facing transport controls cannot alter visualization magnitudes.
+    audioElement.volume = clamp(Number(audioInfo.volume) / 100, 0, 1);
+    audioElement.muted = Boolean(audioInfo.muted);
 }
 
-function ensureAudioAnalyser() {
-    if (!audioContext) {
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextClass) throw new Error('Web Audio API is unavailable in this browser.');
-        audioContext = new AudioContextClass();
+function createFftWorkspace(size) {
+    const levels = Math.log2(size);
+    if (!Number.isInteger(levels)) throw new Error('FFT size must be a power of two.');
+
+    const real = new Float32Array(size);
+    const imaginary = new Float32Array(size);
+    const bitReversedIndices = new Uint32Array(size);
+    const windowValues = new Float32Array(size);
+
+    for (let index = 0; index < size; index++) {
+        let value = index;
+        let reversed = 0;
+        for (let bit = 0; bit < levels; bit++) {
+            reversed = (reversed << 1) | (value & 1);
+            value >>= 1;
+        }
+        bitReversedIndices[index] = reversed;
+        windowValues[index] =
+            0.42 -
+            0.5 * Math.cos((2 * Math.PI * index) / (size - 1)) +
+            0.08 * Math.cos((4 * Math.PI * index) / (size - 1));
     }
 
-    if (!audioAnalyser) {
-        audioAnalyser = audioContext.createAnalyser();
-        audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
+    const stages = [];
+    for (let blockSize = 2; blockSize <= size; blockSize *= 2) {
+        const halfBlock = blockSize / 2;
+        const phaseStep = (-2 * Math.PI) / blockSize;
+        const cosine = new Float32Array(halfBlock);
+        const sine = new Float32Array(halfBlock);
+        for (let offset = 0; offset < halfBlock; offset++) {
+            const angle = phaseStep * offset;
+            cosine[offset] = Math.cos(angle);
+            sine[offset] = Math.sin(angle);
+        }
+        stages.push({ blockSize, halfBlock, cosine, sine });
     }
 
-    if (audioAnalyser.fftSize !== audioSettings.fftSize) {
-        audioAnalyser.fftSize = audioSettings.fftSize;
-    }
-    if (!audioFrequencyData || audioFrequencyData.length !== audioAnalyser.frequencyBinCount) {
-        audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
-    }
-
-    if (!audioOutputGain) {
-        audioOutputGain = audioContext.createGain();
-        audioOutputGain.connect(audioContext.destination);
-    }
-
-    if (!recordingDestination) {
-        recordingDestination = audioContext.createMediaStreamDestination();
-        audioOutputGain.connect(recordingDestination);
-    }
-
-    applyAudioOutputGain();
+    return { size, real, imaginary, bitReversedIndices, windowValues, stages };
 }
 
-function getTransportDuration() {
-    return decodedAudioBuffer?.duration || 0;
+function fillFftInput(workspace, channels, channelScale, frameStart) {
+    const { size, real, imaginary, bitReversedIndices, windowValues } = workspace;
+    const sampleCount = channels[0].length;
+    for (let offset = 0; offset < size; offset++) {
+        const sourceIndex = frameStart + offset;
+        let sample = 0;
+        if (sourceIndex >= 0 && sourceIndex < sampleCount) {
+            for (let channel = 0; channel < channels.length; channel++) {
+                sample += channels[channel][sourceIndex] * channelScale;
+            }
+        }
+        const destination = bitReversedIndices[offset];
+        real[destination] = sample * windowValues[offset];
+        imaginary[destination] = 0;
+    }
 }
 
-function getTransportTime() {
-    const duration = getTransportDuration();
-    if (!(duration > 0)) return 0;
-    if (!transportIsPlaying || !audioContext) {
-        return clamp(transportOffset, 0, duration);
-    }
-
-    let time = transportStartedOffset + Math.max(0, audioContext.currentTime - transportStartedAt);
-    if (loopSettings.enabled && loopSettings.end > loopSettings.start) {
-        const start = clamp(loopSettings.start, 0, duration);
-        const end = clamp(loopSettings.end, start, duration);
-        const loopDuration = end - start;
-        if (loopDuration > 0 && time >= end) {
-            time = start + ((time - start) % loopDuration + loopDuration) % loopDuration;
+function runFft(workspace) {
+    const { size, real, imaginary, stages } = workspace;
+    for (const stage of stages) {
+        const { blockSize, halfBlock, cosine, sine } = stage;
+        for (let blockStart = 0; blockStart < size; blockStart += blockSize) {
+            for (let offset = 0; offset < halfBlock; offset++) {
+                const evenIndex = blockStart + offset;
+                const oddIndex = evenIndex + halfBlock;
+                const oddReal = real[oddIndex] * cosine[offset] - imaginary[oddIndex] * sine[offset];
+                const oddImaginary = real[oddIndex] * sine[offset] + imaginary[oddIndex] * cosine[offset];
+                const evenReal = real[evenIndex];
+                const evenImaginary = imaginary[evenIndex];
+                real[oddIndex] = evenReal - oddReal;
+                imaginary[oddIndex] = evenImaginary - oddImaginary;
+                real[evenIndex] = evenReal + oddReal;
+                imaginary[evenIndex] = evenImaginary + oddImaginary;
+            }
         }
     }
-    return clamp(time, 0, duration);
 }
 
-function stopTransportSource() {
-    if (!transportSource) return;
-    transportSource.onended = null;
-    try { transportSource.stop(); } catch (_) {}
-    try { transportSource.disconnect(); } catch (_) {}
-    transportSource = null;
+function bandBinRange(minimumHz, maximumHz, sampleRate, binCount) {
+    const nyquist = sampleRate / 2;
+    const minHz = Math.min(minimumHz, maximumHz);
+    const maxHz = Math.max(minimumHz, maximumHz);
+    const minimumBin = Math.floor((minHz / nyquist) * binCount);
+    const maximumBin = Math.ceil((maxHz / nyquist) * binCount);
+    return {
+        minimumBin: clamp(minimumBin, 0, binCount - 1),
+        maximumBin: clamp(Math.max(maximumBin, minimumBin + 1), 1, binCount),
+    };
 }
 
-function configureTransportLoop(source) {
-    if (!source) return;
-    const duration = getTransportDuration();
-    const start = clamp(loopSettings.start, 0, duration);
-    const end = clamp(loopSettings.end || duration, start, duration);
-    source.loop = Boolean(loopSettings.enabled && end > start + 0.005);
-    if (source.loop) {
-        source.loopStart = start;
-        source.loopEnd = end;
-    }
+function nextEventLoopTurn() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function startTransportAt(seconds) {
-    if (!decodedAudioBuffer) return false;
-    ensureAudioAnalyser();
-
-    const duration = getTransportDuration();
-    let offset = clamp(Number(seconds) || 0, 0, Math.max(0, duration - 1e-6));
-    if (loopSettings.enabled && loopSettings.end > loopSettings.start) {
-        const start = clamp(loopSettings.start, 0, duration);
-        const end = clamp(loopSettings.end, start, duration);
-        if (offset < start || offset >= end) offset = start;
+async function analyzeAudioBufferForVisuals(audioBuffer, fftSize, smoothing, onProgress = () => {}) {
+    const sampleRate = audioBuffer.sampleRate;
+    const duration = audioBuffer.duration;
+    let fps = ANALYSIS_FPS;
+    let frameCount = Math.max(1, Math.ceil(duration * fps));
+    if (frameCount > MAX_ANALYSIS_FRAMES) {
+        fps = MAX_ANALYSIS_FRAMES / duration;
+        frameCount = MAX_ANALYSIS_FRAMES;
     }
 
-    stopTransportSource();
-    const source = audioContext.createBufferSource();
-    source.buffer = decodedAudioBuffer;
-    source.connect(audioAnalyser);
-    source.connect(audioOutputGain);
-    configureTransportLoop(source);
+    const workspace = createFftWorkspace(fftSize);
+    const binCount = fftSize / 2;
+    const channels = [];
+    for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+        channels.push(audioBuffer.getChannelData(channel));
+    }
+    const channelScale = 1 / Math.max(1, channels.length);
 
-    transportSource = source;
-    transportStartedOffset = offset;
-    transportStartedAt = audioContext.currentTime;
-    transportOffset = offset;
-    transportIsPlaying = true;
+    const bass = new Float32Array(frameCount);
+    const mids = new Float32Array(frameCount);
+    const highs = new Float32Array(frameCount);
+    const level = new Float32Array(frameCount);
+    const centroid = new Float32Array(frameCount);
 
-    source.onended = () => {
-        if (transportSource !== source) return;
-        transportSource = null;
-        if (source.loop) return;
-        transportIsPlaying = false;
-        transportOffset = duration;
-        audioInfo.currentTime = formatTime(duration);
-        audioInfo.seekPercent = 100;
-        audioInfo.status = 'Ended';
-        refreshAudioInfo();
+    const bassRange = bandBinRange(audioReactive.bassMinHz, audioReactive.bassMaxHz, sampleRate, binCount);
+    const midsRange = bandBinRange(audioReactive.midsMinHz, audioReactive.midsMaxHz, sampleRate, binCount);
+    const highsRange = bandBinRange(audioReactive.highsMinHz, audioReactive.highsMaxHz, sampleRate, binCount);
+
+    const smoothed = new Float32Array(binCount);
+    const normalized = new Float32Array(binCount);
+    const decibelRange = MAX_DECIBELS - MIN_DECIBELS;
+    const smoothingFactor = clamp(Number(smoothing) || 0, 0, 0.95);
+    const hop = sampleRate / fps;
+    let lastYield = performance.now();
+
+    const averageRange = (range) => {
+        let sum = 0;
+        for (let bin = range.minimumBin; bin < range.maximumBin; bin++) sum += normalized[bin];
+        return sum / Math.max(1, range.maximumBin - range.minimumBin);
     };
 
-    source.start(0, offset);
-    return true;
-}
+    for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+        const frameStart = Math.round(frameIndex * hop) - Math.floor(fftSize / 2);
+        fillFftInput(workspace, channels, channelScale, frameStart);
+        runFft(workspace);
 
-async function playTransport() {
-    if (!decodedAudioBuffer) return false;
-    ensureAudioAnalyser();
-    if (audioContext.state === 'suspended') await audioContext.resume();
+        let centroidWeighted = 0;
+        let centroidMagnitude = 0;
+        const { real, imaginary } = workspace;
+        for (let bin = 0; bin < binCount; bin++) {
+            const magnitude = Math.sqrt(real[bin] * real[bin] + imaginary[bin] * imaginary[bin]) / fftSize;
+            smoothed[bin] = smoothingFactor * smoothed[bin] + (1 - smoothingFactor) * magnitude;
+            const decibels = 20 * Math.log10(Math.max(smoothed[bin], 1e-12));
+            normalized[bin] = clamp(((decibels - MIN_DECIBELS) / decibelRange), 0, 1);
 
-    const duration = getTransportDuration();
-    if (transportOffset >= duration - 1e-4) transportOffset = 0;
-    if (loopSettings.enabled && loopSettings.end > loopSettings.start) {
-        if (transportOffset < loopSettings.start || transportOffset >= loopSettings.end) {
-            transportOffset = loopSettings.start;
+            const frequencyHz = (bin * sampleRate) / fftSize;
+            if (frequencyHz >= 20 && frequencyHz <= Math.min(20000, sampleRate / 2)) {
+                centroidWeighted += frequencyHz * normalized[bin];
+                centroidMagnitude += normalized[bin];
+            }
+        }
+
+        bass[frameIndex] = averageRange(bassRange);
+        mids[frameIndex] = averageRange(midsRange);
+        highs[frameIndex] = averageRange(highsRange);
+        level[frameIndex] = bass[frameIndex] * 0.5 + mids[frameIndex] * 0.3 + highs[frameIndex] * 0.2;
+
+        if (centroidMagnitude > 1e-5) {
+            const centroidHz = centroidWeighted / centroidMagnitude;
+            const maxHz = Math.min(20000, sampleRate / 2);
+            centroid[frameIndex] = clamp(
+                Math.log(Math.max(20, centroidHz) / 20) / Math.log(maxHz / 20),
+                0,
+                1,
+            );
+        } else {
+            centroid[frameIndex] = 0.5;
+        }
+
+        const now = performance.now();
+        if (now - lastYield > 50) {
+            lastYield = now;
+            onProgress((frameIndex + 1) / frameCount);
+            await nextEventLoopTurn();
         }
     }
 
-    const started = startTransportAt(transportOffset);
-    if (started) {
-        audioInfo.status = 'Playing';
-        refreshAudioInfo();
+    onProgress(1);
+    return { fps, frameCount, duration, bass, mids, highs, level, centroid };
+}
+
+function sampleAnalysisArray(array, seconds) {
+    if (!audioAnalysis || !array?.length) return 0;
+    const position = clamp(seconds, 0, audioAnalysis.duration) * audioAnalysis.fps;
+    const first = clamp(Math.floor(position), 0, array.length - 1);
+    const second = Math.min(array.length - 1, first + 1);
+    const mixAmount = position - first;
+    return array[first] + (array[second] - array[first]) * mixAmount;
+}
+
+function readAudioLevels() {
+    if (!audioAnalysis || audioElement.paused || audioElement.ended) {
+        return { bass: 0, mids: 0, highs: 0, level: 0 };
     }
-    return started;
+    const time = audioElement.currentTime || 0;
+    const sensitivity = Math.max(0, Number(audioReactive.sensitivity) || 0);
+    const bass = clamp(sampleAnalysisArray(audioAnalysis.bass, time) * sensitivity, 0, 1);
+    const mids = clamp(sampleAnalysisArray(audioAnalysis.mids, time) * sensitivity, 0, 1);
+    const highs = clamp(sampleAnalysisArray(audioAnalysis.highs, time) * sensitivity, 0, 1);
+    const level = clamp(bass * 0.5 + mids * 0.3 + highs * 0.2, 0, 1);
+    return { bass, mids, highs, level };
 }
 
-function pauseTransport() {
-    if (!transportIsPlaying) return;
-    transportOffset = getTransportTime();
-    transportIsPlaying = false;
-    stopTransportSource();
-    if (audioInfo.status !== 'Loading audio…') audioInfo.status = 'Paused';
-    refreshAudioInfo();
+function getSpectralCentroid() {
+    if (!audioAnalysis || audioElement.paused || audioElement.ended) return 0.5;
+    return clamp(sampleAnalysisArray(audioAnalysis.centroid, audioElement.currentTime || 0), 0, 1);
 }
 
-function seekTransport(seconds) {
-    const duration = getTransportDuration();
-    if (!(duration > 0)) return;
-    const wasPlaying = transportIsPlaying;
-    const next = clamp(Number(seconds) || 0, 0, duration);
-    transportOffset = next;
-    if (wasPlaying) startTransportAt(next);
-    audioInfo.currentTime = formatTime(next);
-    audioInfo.seekPercent = (next / duration) * 100;
+async function rebuildAudioAnalysis(progressLabel = null) {
+    if (!decodedAudioBuffer) return false;
+    const version = ++audioAnalysisVersion;
+    const label = progressLabel || `Audio analysis · ${audioInfo.name}`;
+    const previousAnalysis = audioAnalysis;
+    audioInfo.decode = 'Analyzing…';
     refreshAudioInfo();
+
+    try {
+        const analysis = await analyzeAudioBufferForVisuals(
+            decodedAudioBuffer,
+            audioSettings.fftSize,
+            audioReactive.smoothing,
+            (fraction) => updateLoadProgress('audio', 0.65 + fraction * 0.35, label),
+        );
+        if (version !== audioAnalysisVersion) return false;
+        audioAnalysis = analysis;
+        audioInfo.decode = 'Ready';
+        refreshAudioInfo();
+        return true;
+    } catch (error) {
+        console.error('Audio analysis failed:', error);
+        if (version === audioAnalysisVersion) {
+            audioAnalysis = previousAnalysis;
+            audioInfo.decode = previousAnalysis ? 'Ready' : 'Analysis failed';
+            refreshAudioInfo();
+        }
+        return false;
+    }
+}
+
+function scheduleAudioReanalysis() {
+    if (!decodedAudioBuffer) return;
+    if (audioReanalysisTimer) clearTimeout(audioReanalysisTimer);
+    audioReanalysisTimer = setTimeout(() => {
+        audioReanalysisTimer = null;
+        void rebuildAudioAnalysis();
+    }, 220);
 }
 
 function setAudioResolution(fftSize) {
     const next = Number(fftSize);
     if (![256, 512, 1024, 2048, 4096, 8192, 16384].includes(next)) return;
     audioSettings.fftSize = next;
-    ensureAudioAnalyser();
-    audioAnalyser.fftSize = next;
-    audioFrequencyData = new Uint8Array(audioAnalyser.frequencyBinCount);
-}
-
-function getBandLevel(minHz, maxHz) {
-    if (!audioAnalyser || !audioFrequencyData || !audioContext) return 0;
-
-    const nyquist = audioContext.sampleRate / 2;
-    const firstBin = Math.max(0, Math.floor((minHz / nyquist) * audioFrequencyData.length));
-    const lastBin = Math.min(audioFrequencyData.length - 1, Math.ceil((maxHz / nyquist) * audioFrequencyData.length));
-    if (lastBin < firstBin) return 0;
-
-    let total = 0;
-    for (let i = firstBin; i <= lastBin; i++) total += audioFrequencyData[i];
-    return (total / (lastBin - firstBin + 1)) / 255;
-}
-
-function readAudioLevels() {
-    if (!audioAnalyser || !audioFrequencyData || !transportIsPlaying) {
-        return { bass: 0, mids: 0, highs: 0, level: 0 };
-    }
-
-    audioAnalyser.smoothingTimeConstant = audioReactive.smoothing;
-    audioAnalyser.getByteFrequencyData(audioFrequencyData);
-
-    const sensitivity = audioReactive.sensitivity;
-    const bassMin = Math.min(audioReactive.bassMinHz, audioReactive.bassMaxHz);
-    const bassMax = Math.max(audioReactive.bassMinHz, audioReactive.bassMaxHz);
-    const midsMin = Math.min(audioReactive.midsMinHz, audioReactive.midsMaxHz);
-    const midsMax = Math.max(audioReactive.midsMinHz, audioReactive.midsMaxHz);
-    const highsMin = Math.min(audioReactive.highsMinHz, audioReactive.highsMaxHz);
-    const highsMax = Math.max(audioReactive.highsMinHz, audioReactive.highsMaxHz);
-
-    const bass = Math.min(1, getBandLevel(bassMin, bassMax) * sensitivity);
-    const mids = Math.min(1, getBandLevel(midsMin, midsMax) * sensitivity);
-    const highs = Math.min(1, getBandLevel(highsMin, highsMax) * sensitivity);
-    const level = Math.min(1, ((bass * 0.5) + (mids * 0.3) + (highs * 0.2)));
-
-    return { bass, mids, highs, level };
-}
-
-function getSpectralCentroid() {
-    if (!audioAnalyser || !audioFrequencyData || !audioContext || !transportIsPlaying) return 0.5;
-    let weighted = 0;
-    let total = 0;
-    for (let i = 0; i < audioFrequencyData.length; i++) {
-        const magnitude = audioFrequencyData[i] / 255;
-        weighted += i * magnitude;
-        total += magnitude;
-    }
-    if (total <= 1e-6) return 0.5;
-    return Math.max(0, Math.min(1, (weighted / total) / Math.max(1, audioFrequencyData.length - 1)));
+    scheduleAudioReanalysis();
 }
 
 async function toggleAudioPlayback() {
-    if (!decodedAudioBuffer) {
+    if (!audioElement.src) {
         audioFileInput.click();
         return;
     }
 
-    try {
-        if (transportIsPlaying) {
-            pauseTransport();
-        } else {
-            await playTransport();
+    if (audioElement.paused) {
+        const duration = audioElement.duration || decodedAudioBuffer?.duration || 0;
+        if (loopSettings.enabled && duration > 0) {
+            const start = clamp(loopSettings.start, 0, duration);
+            const end = clamp(loopSettings.end || duration, start, duration);
+            if (audioElement.currentTime < start || audioElement.currentTime >= end) {
+                audioElement.currentTime = start;
+            }
         }
-    } catch (error) {
-        console.error('Audio playback failed:', error);
-        transportIsPlaying = false;
-        audioInfo.status = 'Playback failed';
-        refreshAudioInfo();
+        try {
+            await audioElement.play();
+        } catch (error) {
+            console.error('Audio playback failed:', error);
+            audioInfo.status = 'Playback failed';
+            refreshAudioInfo();
+        }
+    } else {
+        audioElement.pause();
     }
 }
 
 async function loadAudioFile(file) {
     if (!file) return;
 
-    pauseTransport();
-    stopTransportSource();
-    transportOffset = 0;
+    audioElement.pause();
+    audioElement.currentTime = 0;
+    audioAnalysisVersion++;
+    audioAnalysis = null;
     audioInfo.status = 'Loading audio…';
     refreshAudioInfo();
 
@@ -596,7 +651,7 @@ async function loadAudioFile(file) {
             const reader = new FileReader();
             reader.addEventListener('progress', (event) => {
                 if (event.lengthComputable && event.total > 0) {
-                    updateLoadProgress('audio', event.loaded / event.total, progressLabel);
+                    updateLoadProgress('audio', (event.loaded / event.total) * 0.45, progressLabel);
                 }
             });
             reader.addEventListener('load', () => resolve(reader.result), { once: true });
@@ -605,28 +660,45 @@ async function loadAudioFile(file) {
             reader.readAsArrayBuffer(file);
         });
 
-        try {
-            decodedAudioBuffer = await getDecodeAudioContext().decodeAudioData(arrayBuffer.slice(0));
-            audioInfo.duration = formatTime(decodedAudioBuffer.duration, true);
-            audioInfo.sampleRate = `${decodedAudioBuffer.sampleRate.toLocaleString()} Hz`;
-            audioInfo.channels = String(decodedAudioBuffer.numberOfChannels);
-            audioInfo.decode = 'Ready';
-            loopSettings.start = 0;
-            loopSettings.end = decodedAudioBuffer.duration;
-        } catch (decodeError) {
-            console.error('Audio decode failed.', decodeError);
-            decodedAudioBuffer = null;
-            audioInfo.decode = 'Failed';
-            throw new Error('The selected audio file could not be decoded for playback.');
-        }
+        updateLoadProgress('audio', 0.5, `Audio · decoding ${file.name}`);
+        decodedAudioBuffer = await getDecodeAudioContext().decodeAudioData(arrayBuffer.slice(0));
+        audioInfo.duration = formatTime(decodedAudioBuffer.duration, true);
+        audioInfo.sampleRate = `${decodedAudioBuffer.sampleRate.toLocaleString()} Hz`;
+        audioInfo.channels = String(decodedAudioBuffer.numberOfChannels);
+        audioInfo.decode = 'Analyzing…';
+        loopSettings.start = 0;
+        loopSettings.end = decodedAudioBuffer.duration;
 
-        const duration = decodedAudioBuffer?.duration || 0;
-        if (duration > 0) {
-            loopSettings.start = 0;
-            loopSettings.end = duration;
-            audioInfo.duration = formatTime(duration, true);
-        }
-        transportOffset = 0;
+        if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+        audioObjectUrl = URL.createObjectURL(file);
+        audioElement.src = audioObjectUrl;
+        audioElement.load();
+        applyAudioOutputGain();
+
+        await new Promise((resolve, reject) => {
+            const timeout = window.setTimeout(() => reject(new Error('Audio load timeout.')), 15000);
+            const onReady = () => {
+                window.clearTimeout(timeout);
+                audioElement.removeEventListener('error', onError);
+                resolve();
+            };
+            const onError = () => {
+                window.clearTimeout(timeout);
+                audioElement.removeEventListener('loadedmetadata', onReady);
+                reject(new Error('The selected audio file could not be loaded.'));
+            };
+            audioElement.addEventListener('loadedmetadata', onReady, { once: true });
+            audioElement.addEventListener('error', onError, { once: true });
+        });
+
+        const duration = decodedAudioBuffer.duration || audioElement.duration || 0;
+        loopSettings.start = 0;
+        loopSettings.end = duration;
+        audioInfo.duration = formatTime(duration, true);
+
+        const analyzed = await rebuildAudioAnalysis(progressLabel);
+        if (!analyzed && !audioAnalysis) throw new Error('Audio analysis failed.');
+
         updateAudioLoopMode();
         audioInfo.status = 'Ready';
         completeLoadProgress('audio', progressLabel);
@@ -635,6 +707,7 @@ async function loadAudioFile(file) {
     } catch (error) {
         console.error(error);
         decodedAudioBuffer = null;
+        audioAnalysis = null;
         audioInfo.decode = 'Failed';
         audioInfo.status = 'Audio load failed';
         refreshAudioInfo();
@@ -661,15 +734,29 @@ window.addEventListener('drop', (event) => {
     }
 });
 
+function hasPartialLoopSelection() {
+    const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
+    if (!(duration > 0)) return false;
+    return loopSettings.start > 0.001 || loopSettings.end < duration - 0.001;
+}
 
 function updateAudioLoopMode() {
-    if (transportSource) configureTransportLoop(transportSource);
+    // Match the Boid reference transport: full-track looping uses the native
+    // element's loop flag; partial loops are enforced by the main render tick.
+    audioElement.loop = Boolean(loopSettings.enabled && !hasPartialLoopSelection());
 }
 
 function enforceAudioLoopRange() {
-    // AudioBufferSourceNode handles the applied loop natively at audio-clock
-    // precision. Avoid repeatedly assigning currentTime on an HTMLMediaElement;
-    // those decoder seeks were the source of loop gaps, clicks and stuttering.
+    if (!loopSettings.enabled || !hasPartialLoopSelection() || audioElement.paused) return;
+    const start = loopSettings.start;
+    const end = loopSettings.end;
+    if (!(end > start)) return;
+
+    if (audioElement.currentTime >= end - 0.005) {
+        audioElement.currentTime = start;
+    } else if (audioElement.currentTime < start - 0.05) {
+        audioElement.currentTime = start;
+    }
 }
 
 function snapLoopTime(seconds) {
@@ -679,7 +766,7 @@ function snapLoopTime(seconds) {
 }
 
 function applyLoopBars() {
-    const duration = getTransportDuration();
+    const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
     if (!duration) return;
     loopSettings.start = Math.max(0, Math.min(duration, snapLoopTime(loopSettings.start)));
     const barSeconds = (60 / Math.max(1, loopSettings.bpm)) * 4;
@@ -689,7 +776,7 @@ function applyLoopBars() {
 }
 
 function setFullTrackLoop() {
-    const duration = getTransportDuration();
+    const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
     if (!duration) return;
     loopSettings.start = 0;
     loopSettings.end = duration;
@@ -765,7 +852,6 @@ async function detectLoopBpm(audioBuffer = decodedAudioBuffer) {
     return bpm;
 }
 
-
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
@@ -812,7 +898,7 @@ const galaxyLoopController = (() => {
 
   // ── Entry point ──
   function openLoopPopup() {
-      if (popupOpen || !decodedAudioBuffer) return;
+      if (popupOpen || !Boolean(decodedAudioBuffer && audioElement.src) || !decodedAudioBuffer) return;
       popupOpen = true;
       popupIsPlaying = false;
       popupSource = null;
@@ -821,7 +907,9 @@ const galaxyLoopController = (() => {
       popupBpm = clamp(loopSettings.bpm || 120, 40, 300);
       popupLoopBars = Math.max(1, Math.round(loopSettings.bars || 4));
 
-      pauseTransport();
+      if (audioElement) {
+          try { audioElement.pause(); } catch (_) {}
+      }
       const mainPlayBtn = document.getElementById('play-btn');
       if (mainPlayBtn) {
           mainPlayBtn.textContent = '▶ Play';
@@ -1678,7 +1766,7 @@ const galaxyLoopController = (() => {
   }
 
   function applyAudioLoop(start, end) {
-      const duration = getTransportDuration();
+      const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
       if (!(duration > 0)) return;
 
       const nextStart = clamp(Number(start) || 0, 0, duration);
@@ -1696,7 +1784,9 @@ const galaxyLoopController = (() => {
       // place the main playback head at the selected start so the next Play
       // action begins inside the committed region.
       if (loopSettings.enabled) {
-          seekTransport(loopSettings.start);
+          audioElement.currentTime = loopSettings.start;
+          audioInfo.currentTime = formatTime(loopSettings.start);
+          audioInfo.seekPercent = duration > 0 ? (loopSettings.start / duration) * 100 : 0;
           audioInfo.status = `Loop applied · ${formatTime(loopSettings.start, true)} – ${formatTime(loopSettings.end, true)}`;
       }
 
@@ -1708,7 +1798,7 @@ const galaxyLoopController = (() => {
   }
 
   function clearAudioLoop() {
-      const duration = getTransportDuration();
+      const duration = decodedAudioBuffer?.duration || audioElement.duration || 0;
       loopSettings.enabled = false;
       loopSettings.start = 0;
       loopSettings.end = duration;
@@ -1722,6 +1812,36 @@ const galaxyLoopController = (() => {
   return { open: openLoopPopup, close: closePopup, syncButton: updateMainLoopButton };
 })();
 
+
+audioElement.addEventListener('loadedmetadata', () => {
+    if (Number.isFinite(audioElement.duration)) {
+        audioInfo.duration = formatTime(audioElement.duration, true);
+        if (!loopSettings.end) loopSettings.end = audioElement.duration;
+    }
+    refreshAudioInfo();
+});
+
+audioElement.addEventListener('timeupdate', () => {
+    const duration = audioElement.duration || 0;
+    audioInfo.currentTime = formatTime(audioElement.currentTime);
+    audioInfo.seekPercent = duration > 0 ? (audioElement.currentTime / duration) * 100 : 0;
+    refreshAudioInfo();
+});
+
+audioElement.addEventListener('play', () => {
+    audioInfo.status = 'Playing';
+    refreshAudioInfo();
+});
+audioElement.addEventListener('pause', () => {
+    if (!audioElement.ended && audioInfo.status !== 'Loading audio…') {
+        audioInfo.status = 'Paused';
+        refreshAudioInfo();
+    }
+});
+audioElement.addEventListener('ended', () => {
+    audioInfo.status = 'Ended';
+    refreshAudioInfo();
+});
 
 
 
@@ -2658,7 +2778,7 @@ async function startVideoExport() {
         stopVideoExport();
         return;
     }
-    if (!decodedAudioBuffer) {
+    if (!audioElement.src) {
         exportSettings.status = 'Load audio before video export';
         pane.refresh();
         return;
@@ -2669,16 +2789,19 @@ async function startVideoExport() {
         return;
     }
 
-    ensureAudioAnalyser();
-    if (audioContext.state === 'suspended') await audioContext.resume();
     exportOverrideSize = getExportDimensions();
     resizeRendererToDisplaySize();
 
     const frameRate = Number(exportSettings.frameRate) || 60;
     const canvasStream = cnvs.captureStream(frameRate);
     const tracks = [...canvasStream.getVideoTracks()];
-    if (recordingDestination?.stream?.getAudioTracks().length) {
-        tracks.push(...recordingDestination.stream.getAudioTracks());
+    // Keep preview playback on the browser's native media pipeline. For video
+    // export, capture that same media element directly instead of inserting a
+    // Web Audio processing graph into normal playback.
+    const captureAudio = audioElement.captureStream || audioElement.mozCaptureStream;
+    if (typeof captureAudio === 'function') {
+        const audioStream = captureAudio.call(audioElement);
+        tracks.push(...audioStream.getAudioTracks());
     }
     const stream = new MediaStream(tracks);
     const mimeType = chooseRecordingMimeType();
@@ -2706,18 +2829,18 @@ async function startVideoExport() {
         pane.refresh();
     });
 
-    const duration = getTransportDuration();
+    const duration = audioElement.duration || 0;
     const useLoopRange = loopSettings.enabled && duration > 0;
     const start = useLoopRange ? Math.max(0, loopSettings.start) : 0;
     const end = useLoopRange ? Math.min(duration, loopSettings.end || duration) : duration;
     exportPreviousLoop = loopSettings.enabled;
     loopSettings.enabled = false;
     updateAudioLoopMode();
-    seekTransport(start);
+    audioElement.currentTime = start;
     exportStopAt = end;
     exportSettings.status = 'Exporting video…';
     mediaRecorder.start(500);
-    await playTransport();
+    await audioElement.play();
     pane.refresh();
 }
 
@@ -2782,8 +2905,8 @@ async function initControls() {
             audioFolder.addBinding(audioInfo, 'currentTime', { label: 'Time', readonly: true }),
         ];
         seekBinding = audioFolder.addBinding(audioInfo, 'seekPercent', { min: 0, max: 100, step: 0.1, label: 'Seek %' }).on('change', (event) => {
-            const duration = getTransportDuration();
-            if (duration > 0) seekTransport(duration * (event.value / 100));
+            const duration = audioElement.duration || 0;
+            if (duration > 0) audioElement.currentTime = duration * (event.value / 100);
         });
         audioFolder.addBinding(audioInfo, 'volume', { min: 0, max: 100, step: 1, label: 'Volume' }).on('change', () => {
             applyAudioOutputGain();
@@ -2809,7 +2932,7 @@ async function initControls() {
         fftBlade.on('change', (event) => setAudioResolution(event.value));
 
         audioFolder.addBinding(audioReactive, 'sensitivity', { min: 0.1, max: 4, step: 0.01, label: 'Sensitivity' });
-        audioFolder.addBinding(audioReactive, 'smoothing', { min: 0, max: 0.95, step: 0.01, label: 'Smoothing' });
+        audioFolder.addBinding(audioReactive, 'smoothing', { min: 0, max: 0.95, step: 0.01, label: 'Smoothing' }).on('change', scheduleAudioReanalysis);
 
         const reactivityFolder = audioFolder.addFolder({ title: 'Reactivity', expanded: true });
         reactivityFolder.addBinding(audioReactive, 'lowMeshSizeResponse', { min: 0, max: 1.5, step: 0.01, label: 'Low → Mesh Size' });
@@ -2818,12 +2941,12 @@ async function initControls() {
         reactivityFolder.addBinding(audioReactive, 'dissolveMotionResponse', { min: 0, max: 5, step: 0.01, label: 'Dissolve Motion' });
 
         const frequencyFolder = audioFolder.addFolder({ title: 'Frequency Bands', expanded: false });
-        frequencyFolder.addBinding(audioReactive, 'bassMinHz', { min: 20, max: 20000, step: 10, label: 'Low Min Hz' });
-        frequencyFolder.addBinding(audioReactive, 'bassMaxHz', { min: 20, max: 20000, step: 10, label: 'Low Max Hz' });
-        frequencyFolder.addBinding(audioReactive, 'midsMinHz', { min: 20, max: 20000, step: 10, label: 'Mids Min Hz' });
-        frequencyFolder.addBinding(audioReactive, 'midsMaxHz', { min: 20, max: 20000, step: 10, label: 'Mids Max Hz' });
-        frequencyFolder.addBinding(audioReactive, 'highsMinHz', { min: 20, max: 20000, step: 10, label: 'Highs Min Hz' });
-        frequencyFolder.addBinding(audioReactive, 'highsMaxHz', { min: 20, max: 20000, step: 10, label: 'Highs Max Hz' });
+        frequencyFolder.addBinding(audioReactive, 'bassMinHz', { min: 20, max: 20000, step: 10, label: 'Low Min Hz' }).on('change', scheduleAudioReanalysis);
+        frequencyFolder.addBinding(audioReactive, 'bassMaxHz', { min: 20, max: 20000, step: 10, label: 'Low Max Hz' }).on('change', scheduleAudioReanalysis);
+        frequencyFolder.addBinding(audioReactive, 'midsMinHz', { min: 20, max: 20000, step: 10, label: 'Mids Min Hz' }).on('change', scheduleAudioReanalysis);
+        frequencyFolder.addBinding(audioReactive, 'midsMaxHz', { min: 20, max: 20000, step: 10, label: 'Mids Max Hz' }).on('change', scheduleAudioReanalysis);
+        frequencyFolder.addBinding(audioReactive, 'highsMinHz', { min: 20, max: 20000, step: 10, label: 'Highs Min Hz' }).on('change', scheduleAudioReanalysis);
+        frequencyFolder.addBinding(audioReactive, 'highsMaxHz', { min: 20, max: 20000, step: 10, label: 'Highs Max Hz' }).on('change', scheduleAudioReanalysis);
 
         const viewportFolder = controller.addFolder({ title: 'Viewport', expanded: false });
         const viewportBlade = createTweakList(viewportFolder, 'Format', Object.keys(viewportAspects), Object.keys(viewportAspects));
@@ -2953,7 +3076,6 @@ function floatMeshes(time) {
 const clock = new THREE.Clock();
 let dissolveMotionPhase = 0;
 let previousAnimationTime = performance.now();
-let lastTransportUiUpdate = 0;
 function animate() {
     let time = clock.getElapsedTime();
     const animationNow = performance.now();
@@ -2990,17 +3112,6 @@ function animate() {
 
     enforceAudioLoopRange();
 
-    if (animationNow - lastTransportUiUpdate >= 200) {
-        const duration = getTransportDuration();
-        const currentTime = getTransportTime();
-        audioInfo.currentTime = formatTime(currentTime);
-        audioInfo.seekPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-        if (seekBinding) seekBinding.refresh();
-        const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
-        if (timeBinding) timeBinding.refresh();
-        lastTransportUiUpdate = animationNow;
-    }
-
     const meshScale = 1 + audio.bass * audioReactive.lowMeshSizeResponse;
     mesh.scale.setScalar(meshScale);
     particleMesh.scale.setScalar(meshScale);
@@ -3032,8 +3143,8 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
-    if (mediaRecorder?.state === 'recording' && exportStopAt != null && getTransportTime() >= exportStopAt - 0.02) {
-        pauseTransport();
+    if (mediaRecorder?.state === 'recording' && exportStopAt != null && audioElement.currentTime >= exportStopAt - 0.02) {
+        audioElement.pause();
         stopVideoExport();
     }
 
