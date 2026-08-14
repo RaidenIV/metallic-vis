@@ -45,19 +45,6 @@ body {
   pointer-events: auto;
 }
 
-.loading::before,
-.loading::after {
-  pointer-events: none;
-}
-
-.loading::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  z-index: 10000;
-  background: var(--color-bg);
-  pointer-events: none;
-}
 
 .load-progress-stack {
   position: fixed;
