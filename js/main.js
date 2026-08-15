@@ -7,7 +7,9 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
-import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-offline-export-1';
+import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { TAARenderPass } from 'three/addons/postprocessing/TAARenderPass.js';
+import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-hdr-taa-1';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -159,6 +161,18 @@ effectComposer1.renderToScreen = false;
 effectComposer2.addPass(renderPass);
 effectComposer2.addPass(shaderPass);
 effectComposer2.addPass(outPass);
+
+// Supersampled render pass, swapped into the final composer for export only.
+// TAARenderPass with accumulate = false delegates to SSAARenderPass, which
+// fully supersamples 2^sampleLevel jittered camera samples every frame. That is
+// the correct mode for animated content: temporal accumulation across frames
+// would smear anything in motion. Realtime preview keeps the plain RenderPass.
+// Only composer2 is upgraded — composer1 feeds the bloom extraction, which is
+// heavily blurred anyway, and giving the two composers independent jitter
+// sequences would misalign the bloom against the base image.
+const taaRenderPass = new TAARenderPass(scene, cam);
+taaRenderPass.accumulate = false;
+taaRenderPass.unbiased = false;
 
 
 //const stat = new Stats();
@@ -1817,20 +1831,26 @@ const backgroundPresets = {
     'Football Field 2': { type: 'cube', prefix: new URL('../assets/backgrounds/Footballfield2/', import.meta.url).href, postfix: '.jpg' },
     'Swedish Royal Castle': { type: 'cube', prefix: new URL('../assets/backgrounds/SwedishRoyalCastle/', import.meta.url).href, postfix: '.jpg' },
     'Creek': { type: 'cube', prefix: new URL('../assets/backgrounds/Creek/', import.meta.url).href, postfix: '.jpg' },
-    'Grass': { type: 'image', url: new URL('../assets/backgrounds/Grass/Grass.jpg', import.meta.url).href },
-    'Stones': { type: 'image', url: new URL('../assets/backgrounds/Stones/Stones.jpg', import.meta.url).href },
-    'Blue Slate': { type: 'image', url: new URL('../assets/backgrounds/BlueSlate/BlueSlate.jpg', import.meta.url).href },
-    'Molten Rock': { type: 'image', url: new URL('../assets/backgrounds/MoltenRock/MoltenRock.jpg', import.meta.url).href },
-    'Volcanic Eruption': { type: 'image', url: new URL('../assets/backgrounds/VolcanicEruption/VolcanicEruption.jpg', import.meta.url).href },
-    'Violet Flux': { type: 'image', url: new URL('../assets/backgrounds/VioletFlux/VioletFlux.jpg', import.meta.url).href },
     'Ryfjallet': { type: 'cube', prefix: new URL('../assets/backgrounds/Ryfjallet/', import.meta.url).href, postfix: '.jpg' },
     'Ice River': { type: 'cube', prefix: new URL('../assets/backgrounds/IceRiver/', import.meta.url).href, postfix: '.jpg' },
-    'Hornstulls Strand': { type: 'cube', prefix: new URL('../assets/backgrounds/HornstullsStrand/', import.meta.url).href, postfix: '.jpg' },
     'Tantolunden': { type: 'cube', prefix: new URL('../assets/backgrounds/Tantolunden/', import.meta.url).href, postfix: '.jpg' },
     'Vindelalven': { type: 'cube', prefix: new URL('../assets/backgrounds/Vindelalven/', import.meta.url).href, postfix: '.jpg' },
     'Yokohama 3': { type: 'cube', prefix: new URL('../assets/backgrounds/Yokohama3/', import.meta.url).href, postfix: '.jpg' },
-    'Milky Way': { type: 'equirect', url: new URL('../assets/backgrounds/8k_stars_milky_way.jpg', import.meta.url).href },
-    'Stars': { type: 'equirect', url: new URL('../assets/backgrounds/8k_stars.jpg', import.meta.url).href },
+    // Equirectangular HDR panoramas. Stored linear, so they must not be tagged
+    // sRGB, and they feed PMREM directly instead of the canvas downsample path
+    // because a DataTexture has no drawable image.
+    'Studio Small': { type: 'hdr', url: new URL('../assets/backgrounds/StudioSmall/StudioSmall.hdr', import.meta.url).href },
+    'Monochrome Studio': { type: 'hdr', url: new URL('../assets/backgrounds/MonochromeStudio/MonochromeStudio.hdr', import.meta.url).href },
+    'Wooden Studio': { type: 'hdr', url: new URL('../assets/backgrounds/WoodenStudio/WoodenStudio.hdr', import.meta.url).href },
+    'Ferndale Studio 01': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio01/FerndaleStudio01.hdr', import.meta.url).href },
+    'Ferndale Studio 04': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio04/FerndaleStudio04.hdr', import.meta.url).href },
+    'Ferndale Studio 05': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio05/FerndaleStudio05.hdr', import.meta.url).href },
+    'Ferndale Studio 06': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio06/FerndaleStudio06.hdr', import.meta.url).href },
+    'Ferndale Studio 11': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio11/FerndaleStudio11.hdr', import.meta.url).href },
+    'Ferndale Studio 12': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio12/FerndaleStudio12.hdr', import.meta.url).href },
+    'Kloofendal Sky': { type: 'hdr', url: new URL('../assets/backgrounds/KloofendalSky/KloofendalSky.hdr', import.meta.url).href },
+    'German Town Street': { type: 'hdr', url: new URL('../assets/backgrounds/GermanTownStreet/GermanTownStreet.hdr', import.meta.url).href },
+    'Modern Evening Street': { type: 'hdr', url: new URL('../assets/backgrounds/ModernEveningStreet/ModernEveningStreet.hdr', import.meta.url).href },
 };
 const backgroundNames = Object.keys(backgroundPresets);
 const backgroundTextureCache = new Map();
@@ -1865,22 +1885,50 @@ function createEnvironmentSource(image) {
 // PMREMGenerator treats any non-cube texture as equirectangular, so the
 // background texture itself needs no mapping change and scene.background keeps
 // rendering exactly as before.
+// Twelve HDR panoramas make an unbounded cache expensive, so keep only the
+// most recently used targets and dispose the rest.
+const MAX_CACHED_ENVIRONMENTS = 4;
+
+function trimEnvironmentCache() {
+    while (backgroundEnvironmentCache.size > MAX_CACHED_ENVIRONMENTS) {
+        const oldestKey = backgroundEnvironmentCache.keys().next().value;
+        const oldest = backgroundEnvironmentCache.get(oldestKey);
+        backgroundEnvironmentCache.delete(oldestKey);
+        try {
+            oldest?.dispose?.();
+        } catch (error) {
+            console.warn('Environment target could not be disposed.', error);
+        }
+    }
+}
+
 function getBackgroundEnvironment(name, texture) {
     const cached = backgroundEnvironmentCache.get(name);
-    if (cached) return cached.texture;
+    if (cached) {
+        // Re-insert so the most recently used entry is last in the map.
+        backgroundEnvironmentCache.delete(name);
+        backgroundEnvironmentCache.set(name, cached);
+        return cached.texture;
+    }
 
     const image = texture.image;
     if (!image || !(image.width || image.videoWidth)) return null;
 
     if (!pmremGenerator) pmremGenerator = new THREE.PMREMGenerator(re);
 
-    const source = createEnvironmentSource(image);
+    // A DataTexture from RGBELoader has no drawable image, so it cannot go
+    // through the canvas downsample. The HDR files ship at 1024 wide, which is
+    // exactly the size that downsample targets, so PMREM allocates the same
+    // bounded 256px cube either way.
+    const isDataTexture = Boolean(texture.isDataTexture);
+    const source = isDataTexture ? texture : createEnvironmentSource(image);
     try {
         const target = pmremGenerator.fromEquirectangular(source);
         backgroundEnvironmentCache.set(name, target);
+        trimEnvironmentCache();
         return target.texture;
     } finally {
-        source.dispose();
+        if (!isDataTexture) source.dispose();
     }
 }
 let activeBackgroundTexture = null;
@@ -1910,13 +1958,21 @@ async function loadBackground(name) {
             if (preset.type === 'cube') {
                 cubeTextureUrls = generateCubeUrls(preset.prefix, preset.postfix);
                 texture = await new THREE.CubeTextureLoader(manager).loadAsync(cubeTextureUrls);
+                texture.colorSpace = THREE.SRGBColorSpace;
+            } else if (preset.type === 'hdr') {
+                texture = await new RGBELoader(manager).loadAsync(preset.url);
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+                // Radiance HDR carries linear radiance. Tagging it sRGB would
+                // apply the transfer function twice and crush the highlights
+                // that make these panoramas useful as a light source.
+                texture.colorSpace = THREE.LinearSRGBColorSpace;
             } else {
                 texture = await new THREE.TextureLoader(manager).loadAsync(preset.url);
                 if (preset.type === 'equirect') {
                     texture.mapping = THREE.EquirectangularReflectionMapping;
                 }
+                texture.colorSpace = THREE.SRGBColorSpace;
             }
-            texture.colorSpace = THREE.SRGBColorSpace;
             backgroundTextureCache.set(name, texture);
             completeLoadProgress('background', progressLabel);
         }
@@ -2928,6 +2984,7 @@ const exportSettings = {
     frameRate: '60',
     bitrateMbps: '16',
     videoType: 'MP4',
+    aaSamples: '8',
     status: 'Idle',
 };
 let exportOverrideSize = null;
@@ -2935,6 +2992,7 @@ let exportOverrideSize = null;
 // owns the render loop for the duration of the job.
 let offlineExportActive = false;
 let offlineExportCancelled = false;
+let antialiasEnabled = false;
 
 function getExportDimensions() {
     const shortSideMap = { '1080': 1080, '2K': 1440, '4K': 2160 };
@@ -3318,7 +3376,9 @@ function getExportModalRefs() {
 function showExportModal(frameRate, width, height) {
     const refs = getExportModalRefs();
     if (!refs.root) return;
-    if (refs.format) refs.format.textContent = `${width}x${height} · ${frameRate} fps`;
+    const samples = Math.max(1, Number(exportSettings.aaSamples) || 1);
+    const aaLabel = samples > 1 ? ` · ${samples}x AA` : '';
+    if (refs.format) refs.format.textContent = `${width}x${height} · ${frameRate} fps${aaLabel}`;
     if (refs.status) refs.status.textContent = 'Preparing…';
     if (refs.fill) refs.fill.style.width = '0%';
     if (refs.percent) refs.percent.textContent = '0%';
@@ -3426,6 +3486,16 @@ async function startVideoExport() {
         cam.aspect = width / height;
         cam.updateProjectionMatrix();
 
+        // Offline rendering can afford supersampling that would never survive a
+        // realtime capture. sampleLevel is log2 of the sample count.
+        const aaSamples = Math.max(1, Number(exportSettings.aaSamples) || 1);
+        antialiasEnabled = aaSamples > 1;
+        if (antialiasEnabled) {
+            taaRenderPass.sampleLevel = Math.round(Math.log2(aaSamples));
+            taaRenderPass.setSize(width, height);
+            effectComposer2.passes[0] = taaRenderPass;
+        }
+
         const target = new ArrayBufferTarget();
         const muxer = new Muxer({
             target,
@@ -3509,6 +3579,10 @@ async function startVideoExport() {
             if (videoEncoder && videoEncoder.state !== 'closed') videoEncoder.close();
         } catch (error) {
             console.warn('Video encoder cleanup failed', error);
+        }
+        if (antialiasEnabled) {
+            effectComposer2.passes[0] = renderPass;
+            antialiasEnabled = false;
         }
         exportOverrideSize = null;
         resizeRendererToDisplaySize();
@@ -3893,6 +3967,9 @@ async function initControls() {
         const exportBitrateBlade = createTweakList(exportFolder, 'Bitrate', ['6 Mbps', '10 Mbps', '16 Mbps', '24 Mbps'], ['6', '10', '16', '24']);
         exportBitrateBlade.value = exportSettings.bitrateMbps;
         exportBitrateBlade.on('change', (event) => exportSettings.bitrateMbps = event.value);
+        const exportAaBlade = createTweakList(exportFolder, 'AA Samples', ['Off', '4', '8', '16', '32'], ['1', '4', '8', '16', '32']);
+        exportAaBlade.value = exportSettings.aaSamples;
+        exportAaBlade.on('change', (event) => exportSettings.aaSamples = event.value);
         const exportTypeBlade = createTweakList(exportFolder, 'Video Type', ['MP4'], ['MP4']);
         exportSettings.videoType = 'MP4';
         exportTypeBlade.value = exportSettings.videoType;
@@ -3907,6 +3984,7 @@ async function initControls() {
             exportResolutionBlade.value = exportSettings.resolution;
             exportFpsBlade.value = exportSettings.frameRate;
             exportBitrateBlade.value = exportSettings.bitrateMbps;
+            exportAaBlade.value = exportSettings.aaSamples;
             // Legacy settings JSON may carry 'Auto' or 'WebM'; the offline
             // pipeline only muxes MP4, so normalise before touching the blade.
             exportSettings.videoType = 'MP4';
