@@ -7,9 +7,8 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
-import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { TAARenderPass } from 'three/addons/postprocessing/TAARenderPass.js';
-import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-hdr-fix-1';
+import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-sky-reflect-1';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -170,6 +169,55 @@ effectComposer2.addPass(outPass);
 // Only composer2 is upgraded — composer1 feeds the bloom extraction, which is
 // heavily blurred anyway, and giving the two composers independent jitter
 // sequences would misalign the bloom against the base image.
+// Full-resolution equirectangular backdrop.
+//
+// scene.background cannot show an equirect texture (WebGLBackground only takes
+// the projected path for a CubeTexture or CubeUVReflectionMapping), and routing
+// it through a cube render target caps the backdrop at the face size: 1024 per
+// face is only ~683 px across a 1440 px viewport, which is what kept reading as
+// low resolution. Sampling the panorama directly on a sky dome uses every pixel
+// of the 4096-wide source with no intermediate buffer at all.
+const skyUniformData = {
+    tEquirect: { value: null },
+    uIntensity: { value: 1 },
+};
+const skyMaterial = new THREE.ShaderMaterial({
+    name: 'EquirectSky',
+    uniforms: skyUniformData,
+    side: THREE.BackSide,
+    depthTest: false,
+    depthWrite: false,
+    fog: false,
+    vertexShader: `
+        varying vec3 vSkyDirection;
+        void main() {
+            vSkyDirection = normalize((modelMatrix * vec4(position, 0.0)).xyz);
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            gl_Position.z = gl_Position.w;
+        }
+    `,
+    fragmentShader: `
+        #include <common>
+        uniform sampler2D tEquirect;
+        uniform float uIntensity;
+        varying vec3 vSkyDirection;
+        void main() {
+            // three's own equirectUv, the same mapping fromEquirectangularTexture
+            // uses, so the backdrop and the reflection cube stay aligned.
+            gl_FragColor = vec4(texture2D(tEquirect, equirectUv(normalize(vSkyDirection))).rgb * uIntensity, 1.0);
+        }
+    `,
+});
+const skyMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), skyMaterial);
+skyMesh.frustumCulled = false;
+skyMesh.renderOrder = -1e6;
+skyMesh.visible = false;
+skyMesh.onBeforeRender = function (renderer, sceneRef, camera) {
+    this.matrixWorld.copyPosition(camera.matrixWorld);
+};
+scene.add(skyMesh);
+let skyBackgroundActive = false;
+
 const taaRenderPass = new TAARenderPass(scene, cam);
 taaRenderPass.accumulate = false;
 taaRenderPass.unbiased = false;
@@ -287,6 +335,7 @@ const audioReactive = {
     bloomResponse: 1.5,
     particleSizeResponse: 1.25,
     particleSpeedResponse: 1.0,
+    innerGlowResponse: 1.2,
     dissolveMotionResponse: 0,
 };
 
@@ -1853,145 +1902,67 @@ const backgroundPresets = {
     'Tantolunden': { type: 'cube', prefix: new URL('../assets/backgrounds/Tantolunden/', import.meta.url).href, postfix: '.jpg' },
     'Vindelalven': { type: 'cube', prefix: new URL('../assets/backgrounds/Vindelalven/', import.meta.url).href, postfix: '.jpg' },
     'Yokohama 3': { type: 'cube', prefix: new URL('../assets/backgrounds/Yokohama3/', import.meta.url).href, postfix: '.jpg' },
-    // Equirectangular HDR panoramas. Stored linear, so they must not be tagged
-    // sRGB, and they feed PMREM directly instead of the canvas downsample path
-    // because a DataTexture has no drawable image.
-    'Studio Small': { type: 'hdr', url: new URL('../assets/backgrounds/StudioSmall/StudioSmall.hdr', import.meta.url).href },
-    'Monochrome Studio': { type: 'hdr', url: new URL('../assets/backgrounds/MonochromeStudio/MonochromeStudio.hdr', import.meta.url).href },
-    'Wooden Studio': { type: 'hdr', url: new URL('../assets/backgrounds/WoodenStudio/WoodenStudio.hdr', import.meta.url).href },
-    'Ferndale Studio 01': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio01/FerndaleStudio01.hdr', import.meta.url).href },
-    'Ferndale Studio 04': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio04/FerndaleStudio04.hdr', import.meta.url).href },
-    'Ferndale Studio 05': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio05/FerndaleStudio05.hdr', import.meta.url).href },
-    'Ferndale Studio 06': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio06/FerndaleStudio06.hdr', import.meta.url).href },
-    'Ferndale Studio 11': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio11/FerndaleStudio11.hdr', import.meta.url).href },
-    'Ferndale Studio 12': { type: 'hdr', url: new URL('../assets/backgrounds/FerndaleStudio12/FerndaleStudio12.hdr', import.meta.url).href },
-    'Kloofendal Sky': { type: 'hdr', url: new URL('../assets/backgrounds/KloofendalSky/KloofendalSky.hdr', import.meta.url).href },
-    'German Town Street': { type: 'hdr', url: new URL('../assets/backgrounds/GermanTownStreet/GermanTownStreet.hdr', import.meta.url).href },
-    'Modern Evening Street': { type: 'hdr', url: new URL('../assets/backgrounds/ModernEveningStreet/ModernEveningStreet.hdr', import.meta.url).href },
+    // Equirectangular panoramas rendered on the sky dome. Stored with 2 stops
+    // of highlight headroom divided out, recovered by `intensity`, so bright
+    // sources still drive specular instead of clipping flat at 1.0.
+    'Studio Small': { type: 'sky', url: new URL('../assets/backgrounds/StudioSmall/StudioSmall.jpg', import.meta.url).href, intensity: 4 },
+    'Monochrome Studio': { type: 'sky', url: new URL('../assets/backgrounds/MonochromeStudio/MonochromeStudio.jpg', import.meta.url).href, intensity: 4 },
+    'Wooden Studio': { type: 'sky', url: new URL('../assets/backgrounds/WoodenStudio/WoodenStudio.jpg', import.meta.url).href, intensity: 4 },
+    'Ferndale Studio 01': { type: 'sky', url: new URL('../assets/backgrounds/FerndaleStudio01/FerndaleStudio01.jpg', import.meta.url).href, intensity: 4 },
+    'Ferndale Studio 04': { type: 'sky', url: new URL('../assets/backgrounds/FerndaleStudio04/FerndaleStudio04.jpg', import.meta.url).href, intensity: 4 },
+    'Ferndale Studio 05': { type: 'sky', url: new URL('../assets/backgrounds/FerndaleStudio05/FerndaleStudio05.jpg', import.meta.url).href, intensity: 4 },
+    'Ferndale Studio 06': { type: 'sky', url: new URL('../assets/backgrounds/FerndaleStudio06/FerndaleStudio06.jpg', import.meta.url).href, intensity: 4 },
+    'Ferndale Studio 11': { type: 'sky', url: new URL('../assets/backgrounds/FerndaleStudio11/FerndaleStudio11.jpg', import.meta.url).href, intensity: 4 },
+    'Ferndale Studio 12': { type: 'sky', url: new URL('../assets/backgrounds/FerndaleStudio12/FerndaleStudio12.jpg', import.meta.url).href, intensity: 4 },
+    'Kloofendal Sky': { type: 'sky', url: new URL('../assets/backgrounds/KloofendalSky/KloofendalSky.jpg', import.meta.url).href, intensity: 4 },
+    'German Town Street': { type: 'sky', url: new URL('../assets/backgrounds/GermanTownStreet/GermanTownStreet.jpg', import.meta.url).href, intensity: 4 },
+    'Modern Evening Street': { type: 'sky', url: new URL('../assets/backgrounds/ModernEveningStreet/ModernEveningStreet.jpg', import.meta.url).href, intensity: 4 },
 };
 const backgroundNames = Object.keys(backgroundPresets);
 const backgroundTextureCache = new Map();
-// Flat-image backgrounds were pinned to the original cubemap for reflections, so
-// nothing the user selected ever showed up in the metal. Non-cube backgrounds now
-// get a real pre-filtered environment map built from the same image.
+// Reflection cubes for the sky panoramas, keyed by background name.
 const backgroundEnvironmentCache = new Map();
-let pmremGenerator = null;
 let defaultEnvironmentTexture = null;
 
-// PMREMGenerator sizes its cube from source width / 4, so a 3840px background
-// would allocate a 2880x3840 half-float target (~88 MB, twice over with the
-// ping-pong buffer). Downsampling the source to 1024 lands on the 256px cube
-// three documents as ideal and keeps the allocation near 6 MB.
-function createEnvironmentSource(image) {
-    const maxWidth = 1024;
-    const sourceWidth = image.width || image.videoWidth || maxWidth;
-    const sourceHeight = image.height || image.videoHeight || maxWidth;
-    const width = Math.min(maxWidth, sourceWidth);
-    const height = Math.max(1, Math.round((sourceHeight / sourceWidth) * width));
+// Reflection cube for the sky panoramas.
+//
+// Built with three's own fromEquirectangularTexture from the same texture the
+// dome samples, so the reflection can never disagree with the visible backdrop.
+// It is used directly as scene.environment rather than through PMREM: PMREM
+// sizes its cube at source width / 4 and prefilters it, which on a mirror
+// surface reads as smeared reflections. A plain mipmapped cube gives a sharp
+// mirror at face resolution and still lets rough materials fall back to mips —
+// exactly how the existing cube-map presets behave.
+const MAX_CACHED_ENVIRONMENTS = 2;
+const REFLECTION_FACE_SIZE = 1024;
 
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    canvas.getContext('2d').drawImage(image, 0, 0, width, height);
-
-    const source = new THREE.CanvasTexture(canvas);
-    source.colorSpace = THREE.SRGBColorSpace;
-    return source;
-}
-
-// PMREMGenerator treats any non-cube texture as equirectangular, so the
-// background texture itself needs no mapping change and scene.background keeps
-// rendering exactly as before.
-// Equirectangular textures cannot be used directly as scene.background. In
-// r172 WebGLBackground only takes the environment-projected path for a
-// CubeTexture or a CubeUVReflectionMapping texture; anything else falls through
-// to a flat PlaneGeometry, which squashes the whole 2:1 panorama across the
-// screen. So each panorama is converted to a real cube render target for the
-// backdrop, and PMREM'd separately for reflections.
-const MAX_CACHED_ENVIRONMENTS = 3;
-
-// A 1024-per-face half-float cube target is roughly 50 MB, so only the visible
-// one is kept. PMREM targets are a fraction of that and stay cached.
-function releaseUnusedCubeTargets(keepName) {
-    backgroundEnvironmentCache.forEach((entry, key) => {
-        if (key === keepName || !entry?.cubeTarget) return;
-        try {
-            entry.cubeTarget.dispose();
-        } catch (error) {
-            console.warn('Backdrop cube target could not be disposed.', error);
-        }
-        entry.cubeTarget = null;
-        entry.backgroundTexture = null;
-    });
-}
-
-function trimEnvironmentCache() {
+function trimEnvironmentCache(keepName) {
     while (backgroundEnvironmentCache.size > MAX_CACHED_ENVIRONMENTS) {
         const oldestKey = backgroundEnvironmentCache.keys().next().value;
-        if (oldestKey === currentBackgroundName) break;
+        if (oldestKey === keepName) break;
         const oldest = backgroundEnvironmentCache.get(oldestKey);
         backgroundEnvironmentCache.delete(oldestKey);
         try {
-            oldest?.pmrem?.dispose?.();
-            oldest?.cubeTarget?.dispose?.();
+            oldest?.dispose?.();
         } catch (error) {
-            console.warn('Environment target could not be disposed.', error);
+            console.warn('Reflection cube could not be disposed.', error);
         }
     }
 }
 
-function getBackgroundEnvironment(name, texture) {
+function getReflectionCube(name, texture) {
     const cached = backgroundEnvironmentCache.get(name);
     if (cached) {
-        // Re-insert so the most recently used entry is last in the map.
         backgroundEnvironmentCache.delete(name);
         backgroundEnvironmentCache.set(name, cached);
-        if (!cached.cubeTarget && texture.mapping === THREE.EquirectangularReflectionMapping) {
-            const faceSize = clamp(Math.round((texture.image?.width || 2048) / 2), 512, 2048);
-            cached.cubeTarget = new THREE.WebGLCubeRenderTarget(faceSize);
-            cached.cubeTarget.fromEquirectangularTexture(re, texture);
-            cached.backgroundTexture = cached.cubeTarget.texture;
-        }
-        releaseUnusedCubeTargets(name);
-        return cached;
+        return cached.texture;
     }
 
-    const image = texture.image;
-    if (!image || !(image.width || image.videoWidth)) return null;
-
-    if (!pmremGenerator) pmremGenerator = new THREE.PMREMGenerator(re);
-
-    // A DataTexture from RGBELoader has no drawable image, so it cannot go
-    // through the canvas downsample. The HDR files ship at 1024 wide, which is
-    // exactly the size that downsample targets, so PMREM allocates the same
-    // bounded 256px cube either way.
-    const isDataTexture = Boolean(texture.isDataTexture);
-    const source = isDataTexture ? texture : createEnvironmentSource(image);
-
-    let entry = null;
-    try {
-        const pmrem = pmremGenerator.fromEquirectangular(source);
-
-        // Backdrop resolution is independent of the reflection map. A cube face
-        // spans 90 degrees, so at a ~60 degree camera the visible slice is only
-        // two thirds of a face: at 512 that was ~340 px stretched over a 1440 px
-        // viewport, which is what read as low resolution. 1024 per face halves
-        // the upscale and is what a 2048-wide panorama can actually supply.
-        let cubeTarget = null;
-        if (texture.mapping === THREE.EquirectangularReflectionMapping) {
-            const faceSize = clamp(Math.round((image.width || 2048) / 2), 512, 2048);
-            cubeTarget = new THREE.WebGLCubeRenderTarget(faceSize);
-            cubeTarget.fromEquirectangularTexture(re, texture);
-        }
-
-        entry = { pmrem, cubeTarget, environmentTexture: pmrem.texture, backgroundTexture: cubeTarget?.texture || null };
-        backgroundEnvironmentCache.set(name, entry);
-        releaseUnusedCubeTargets(name);
-        trimEnvironmentCache();
-        return entry;
-    } finally {
-        if (!isDataTexture) source.dispose();
-    }
+    const target = new THREE.WebGLCubeRenderTarget(REFLECTION_FACE_SIZE);
+    target.fromEquirectangularTexture(re, texture);
+    backgroundEnvironmentCache.set(name, target);
+    trimEnvironmentCache(name);
+    return target.texture;
 }
 let activeBackgroundTexture = null;
 
@@ -2021,13 +1992,17 @@ async function loadBackground(name) {
                 cubeTextureUrls = generateCubeUrls(preset.prefix, preset.postfix);
                 texture = await new THREE.CubeTextureLoader(manager).loadAsync(cubeTextureUrls);
                 texture.colorSpace = THREE.SRGBColorSpace;
-            } else if (preset.type === 'hdr') {
-                texture = await new RGBELoader(manager).loadAsync(preset.url);
+            } else if (preset.type === 'sky') {
+                texture = await new THREE.TextureLoader(manager).loadAsync(preset.url);
                 texture.mapping = THREE.EquirectangularReflectionMapping;
-                // Radiance HDR carries linear radiance. Tagging it sRGB would
-                // apply the transfer function twice and crush the highlights
-                // that make these panoramas useful as a light source.
-                texture.colorSpace = THREE.LinearSRGBColorSpace;
+                texture.colorSpace = THREE.SRGBColorSpace;
+                // Mipmaps matter on both sides: they stop the dome shimmering
+                // under minification, and fromEquirectangularTexture copies
+                // these settings onto the reflection cube, where they give
+                // rough materials something to blur into.
+                texture.generateMipmaps = true;
+                texture.minFilter = THREE.LinearMipmapLinearFilter;
+                texture.anisotropy = re.capabilities.getMaxAnisotropy();
             } else {
                 texture = await new THREE.TextureLoader(manager).loadAsync(preset.url);
                 if (preset.type === 'equirect') {
@@ -2044,23 +2019,29 @@ async function loadBackground(name) {
         }
 
         currentBackgroundName = name;
+        const intensity = Number.isFinite(preset.intensity) ? preset.intensity : 1;
+        scene.environmentIntensity = intensity;
+        skyUniformData.uIntensity.value = intensity;
+
         if (preset.type === 'cube') {
+            skyBackgroundActive = false;
+            skyUniformData.tEquirect.value = null;
             cubeTexture = texture;
             activeBackgroundTexture = texture;
             scene.background = texture;
             scene.environment = texture;
         } else {
-            let entry = null;
+            skyBackgroundActive = true;
+            skyUniformData.tEquirect.value = texture;
+            activeBackgroundTexture = null;
+            scene.background = null;
+            let environment = null;
             try {
-                entry = getBackgroundEnvironment(name, texture);
+                environment = getReflectionCube(name, texture);
             } catch (environmentError) {
-                console.warn(`Environment map could not be generated for ${name}.`, environmentError);
+                console.warn(`Reflection cube could not be generated for ${name}.`, environmentError);
             }
-            // Fall back to the raw texture only if the conversion failed; a flat
-            // backdrop is still better than none.
-            activeBackgroundTexture = entry?.backgroundTexture || texture;
-            scene.background = activeBackgroundTexture;
-            scene.environment = entry?.environmentTexture || defaultEnvironmentTexture || cubeTexture;
+            scene.environment = environment || defaultEnvironmentTexture || cubeTexture;
         }
 
         cubeCamera.update(re, scene);
@@ -3095,10 +3076,17 @@ function downloadBlob(blob, filename) {
 }
 
 function renderCurrentFrame() {
+    skyMesh.visible = false;
     scene.background = blackColor;
     effectComposer1.render();
-    scene.background = activeBackgroundTexture || cubeTexture || blackColor;
+    if (skyBackgroundActive) {
+        skyMesh.visible = true;
+        scene.background = null;
+    } else {
+        scene.background = activeBackgroundTexture || cubeTexture || blackColor;
+    }
     effectComposer2.render();
+    skyMesh.visible = false;
 }
 
 async function exportPng() {
@@ -3849,9 +3837,10 @@ async function initControls() {
         reactivityFolder.addBinding(audioReactive, 'bloomResponse', { min: 0, max: 5, step: 0.01, label: 'Bloom' });
         reactivityFolder.addBinding(audioReactive, 'particleSizeResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Size' });
         reactivityFolder.addBinding(audioReactive, 'particleSpeedResponse', { min: 0, max: 5, step: 0.01, label: 'Particle Speed' });
+        reactivityFolder.addBinding(audioReactive, 'innerGlowResponse', { min: 0, max: 5, step: 0.01, label: 'Inner Glow' });
         reactivityFolder.addBinding(audioReactive, 'dissolveMotionResponse', { min: 0, max: 5, step: 0.01, label: 'Dissolve Motion' });
         addResetButton(reactivityFolder, () => {
-            for (const key of ['lowMeshSizeResponse', 'bloomResponse', 'particleSizeResponse', 'particleSpeedResponse', 'dissolveMotionResponse']) {
+            for (const key of ['lowMeshSizeResponse', 'bloomResponse', 'particleSizeResponse', 'particleSpeedResponse', 'innerGlowResponse', 'dissolveMotionResponse']) {
                 audioReactive[key] = sectionDefaults.audioReactive[key];
             }
         });
@@ -4143,6 +4132,7 @@ function renderVisualizationFrame(time, delta, audio) {
     const baseParticleSize = particlesUniformData.uBaseSize.value;
     const baseParticleSpeed = particleData.particleSpeedFactor;
     const baseBloomStrength = Math.max(0, Number(tweaks.bloomStrength) || 0);
+    const baseInnerIntensity = innerUniformData.uInnerIntensity.value;
 
     // Move the existing dissolve field dynamically through 3D object space
     // without changing the dissolve threshold. Overall level controls travel
@@ -4178,6 +4168,9 @@ function renderVisualizationFrame(time, delta, audio) {
     // Overall level drives how fast particles travel away from the surface, so
     // the swarm accelerates with the track and settles back in silence.
     particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.level * audioReactive.particleSpeedResponse);
+    // The inner shell reads as the core of the mesh, so it pulses on lows for
+    // the same reason the mesh scale does.
+    innerUniformData.uInnerIntensity.value = baseInnerIntensity * (1 + audio.bass * audioReactive.innerGlowResponse);
 
     updateCameraMotion(time, audio, delta);
 
@@ -4188,17 +4181,26 @@ function renderVisualizationFrame(time, delta, audio) {
 
     floatMeshes(time);
 
+    // Pass 1 extracts bloom against black, so the dome is hidden for it.
+    skyMesh.visible = false;
     scene.background = blackColor;
     effectComposer1.render();
 
-    scene.background = activeBackgroundTexture || cubeTexture || blackColor;
+    if (skyBackgroundActive) {
+        skyMesh.visible = true;
+        scene.background = null;
+    } else {
+        scene.background = activeBackgroundTexture || cubeTexture || blackColor;
+    }
     effectComposer2.render();
+    skyMesh.visible = false;
 
     // Restore baseline values so audio reactivity never rewrites user controls.
     particlesUniformData.uBaseSize.value = baseParticleSize;
     particleData.particleSpeedFactor = baseParticleSpeed;
     unrealBloomPass.strength = baseBloomStrength;
     dissolveUniformData.uEdgeBloomBoost.value = 1;
+    innerUniformData.uInnerIntensity.value = baseInnerIntensity;
 }
 
 
