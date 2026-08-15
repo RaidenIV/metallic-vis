@@ -446,7 +446,7 @@ function configureTransportLoop(source) {
     }
 }
 
-function startTransportAt(seconds) {
+function startTransportAt(seconds, scheduledContextTime = null) {
     if (!decodedAudioBuffer) return false;
     ensureAudioAnalyser();
 
@@ -466,8 +466,11 @@ function startTransportAt(seconds) {
     configureTransportLoop(source);
 
     transportSource = source;
+    const startAt = Number.isFinite(scheduledContextTime)
+        ? Math.max(audioContext.currentTime, scheduledContextTime)
+        : audioContext.currentTime;
     transportStartedOffset = offset;
-    transportStartedAt = audioContext.currentTime;
+    transportStartedAt = startAt;
     transportOffset = offset;
     transportIsPlaying = true;
 
@@ -483,7 +486,7 @@ function startTransportAt(seconds) {
         refreshAudioInfo();
     };
 
-    source.start(0, offset);
+    source.start(startAt, offset);
     return true;
 }
 
@@ -2416,7 +2419,7 @@ function getActiveParticleCount() {
 }
 
 
-function updateParticleAttributes() {
+function updateParticleAttributes(frameScale = 1) {
     const speed = Math.abs(particleData.particleSpeedFactor);
     const velocityX = particleData.velocityFactor.x;
     const velocityY = particleData.velocityFactor.y;
@@ -2457,9 +2460,9 @@ function updateParticleAttributes() {
         const vy = (ny * normalPush + particleVelocityArr[y] * velocityY + ywave * 0.28) * speed;
         const vz = (nz * normalPush + particleVelocityArr[z]) * speed;
 
-        particleCurrPosArr[x] += vx;
-        particleCurrPosArr[y] += vy;
-        particleCurrPosArr[z] += vz;
+        particleCurrPosArr[x] += vx * frameScale;
+        particleCurrPosArr[y] += vy * frameScale;
+        particleCurrPosArr[z] += vz * frameScale;
 
         const dx = particleCurrPosArr[x] - particleInitPosArr[x];
         const dy = particleCurrPosArr[y] - particleInitPosArr[y];
@@ -2940,6 +2943,7 @@ let exportVideoTrack = null;
 let exportManualFrameCapture = false;
 let exportFramesCaptured = 0;
 let exportBeganAt = 0;
+let previousExportTransportTime = null;
 const EXPORT_FRAME_TOLERANCE_MS = 1.5;
 
 function getExportDimensions() {
@@ -3233,6 +3237,12 @@ async function startVideoExport() {
         return;
     }
 
+    // Export must begin from a stopped transport. If the user exports while
+    // playback is already running, seekTransport() would otherwise restart the
+    // source before MediaRecorder exists and then start it a second time below,
+    // producing an audio/video start offset. Resume the AudioContext first, then
+    // arm both tracks from one shared audio-clock origin.
+    pauseTransport();
     ensureAudioAnalyser();
     if (audioContext.state === 'suspended') await audioContext.resume();
     exportOverrideSize = getExportDimensions();
@@ -3297,23 +3307,41 @@ async function startVideoExport() {
     exportPreviousLoop = loopSettings.enabled;
     loopSettings.enabled = false;
     updateAudioLoopMode();
+    // seekTransport() is intentionally called while paused so it cannot create
+    // an early AudioBufferSourceNode. MediaRecorder is started first, and the
+    // source is then scheduled a few milliseconds ahead on the AudioContext
+    // clock. The video pacer uses that exact same clock origin, preventing the
+    // first rendered reactive frame from drifting ahead of or behind the audio.
     seekTransport(start);
     exportStopAt = end;
     exportStartAt = start;
     exportSettings.status = 'Exporting video…';
-    beginExportFramePacing(frameRate);
     showExportModal(frameRate);
     mediaRecorder.start(500);
-    await playTransport();
+
+    const synchronizedStart = audioContext.currentTime;
+    const started = startTransportAt(start, synchronizedStart);
+    if (!started) {
+        stopVideoExport();
+        throw new Error('Could not start synchronized export audio.');
+    }
+    audioInfo.status = 'Playing';
+    beginExportFramePacing(frameRate, synchronizedStart);
     refreshPane();
 }
 
 
-function beginExportFramePacing(frameRate) {
+function beginExportFramePacing(frameRate, synchronizedContextTime = null) {
     exportFrameInterval = frameRate > 0 ? 1000 / frameRate : 0;
-    exportNextFrameTime = performance.now();
+    // Use the Web Audio clock during export. The audio source, FFT analyser and
+    // video frame cadence now share one monotonic timeline instead of mixing
+    // AudioContext.currentTime with performance.now().
+    exportNextFrameTime = audioContext && Number.isFinite(synchronizedContextTime)
+        ? synchronizedContextTime * 1000
+        : (audioContext ? audioContext.currentTime * 1000 : performance.now());
     exportFramesCaptured = 0;
     exportBeganAt = performance.now();
+    previousExportTransportTime = exportStartAt;
 }
 
 
@@ -3329,7 +3357,9 @@ function endExportFramePacing() {
     }
     exportVideoTrack = null;
     exportManualFrameCapture = false;
+    previousExportTransportTime = null;
 }
+
 
 fitViewport();
 window.addEventListener('resize', () => fitViewport());
@@ -3776,18 +3806,30 @@ function animate() {
     // happened to deliver. Rendering only when the next 1/fps slot is due gives
     // the encoder evenly spaced scene time, which is what rotation needs.
     if (exportFrameInterval > 0) {
-        if (animationNow + EXPORT_FRAME_TOLERANCE_MS < exportNextFrameTime) {
+        const exportClockNow = audioContext ? audioContext.currentTime * 1000 : animationNow;
+        if (exportClockNow + EXPORT_FRAME_TOLERANCE_MS < exportNextFrameTime) {
             requestAnimationFrame(animate);
             return;
         }
-        // Clamping to now stops the schedule from trying to claw back a backlog
-        // after a slow frame, which would bunch several renders together.
-        exportNextFrameTime = Math.max(animationNow, exportNextFrameTime + exportFrameInterval);
+        // Clamping to the shared audio clock prevents backlog catch-up bursts
+        // while keeping each captured frame timestamped against the same clock
+        // that advances the recorded audio track.
+        exportNextFrameTime = Math.max(exportClockNow, exportNextFrameTime + exportFrameInterval);
     }
 
-    let time = clock.getElapsedTime();
-    const animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
-    previousAnimationTime = animationNow;
+    const transportTime = exportFrameInterval > 0 ? getTransportTime() : null;
+    let time = exportFrameInterval > 0 ? transportTime : clock.getElapsedTime();
+    let animationDelta;
+    if (exportFrameInterval > 0) {
+        const previous = Number.isFinite(previousExportTransportTime)
+            ? previousExportTransportTime
+            : transportTime;
+        animationDelta = Math.min(0.1, Math.max(0, transportTime - previous));
+        previousExportTransportTime = transportTime;
+    } else {
+        animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
+        previousAnimationTime = animationNow;
+    }
 
     animateDissolve();
     animateMeshRotation(animationDelta);
@@ -3857,7 +3899,11 @@ function animate() {
 
     updateCameraMotion(time, audio, animationDelta);
 
-    updateParticleAttributes();
+    // During export, compensate particle integration for any missed display
+    // frames so particle motion stays on the audio timeline instead of slowing
+    // down when the browser cannot present every requested export frame.
+    const particleFrameScale = exportFrameInterval > 0 ? Math.max(0, animationDelta * 60) : 1;
+    updateParticleAttributes(particleFrameScale);
 
     floatMeshes(time);
 
