@@ -3755,13 +3755,21 @@ let geoIdx = 0;
 let geoLength = geometries.length;
 
 
-function animateDissolve() {
+// Rate per second. The previous form added a fixed amount per frame, so the
+// auto-dissolve cycle ran at whatever the frame rate happened to be: one speed
+// in the preview, a different one in a paced export. These constants are the
+// old per-frame steps scaled by 60, so behaviour at 60 fps is unchanged.
+const DISSOLVE_RATE_PER_SECOND = 0.08 * 60;
+const DISSOLVE_RATE_PER_SECOND_MOBILE = 0.12 * 60;
+
+function animateDissolve(delta = 1 / 60) {
     if (!tweaks.autoDissolve) return;
     let progress = dissolveUniformData.uProgress;
+    const step = (isMobileDevice() ? DISSOLVE_RATE_PER_SECOND_MOBILE : DISSOLVE_RATE_PER_SECOND) * delta;
     if (dissolving) {
-        progress.value += isMobileDevice() ? 0.12 : 0.08;
+        progress.value += step;
     } else {
-        progress.value -= isMobileDevice() ? 0.12 : 0.08;
+        progress.value -= step;
     }
     if (progress.value > 14 && dissolving) {
         dissolving = false;
@@ -3837,14 +3845,19 @@ function animate() {
         const previous = Number.isFinite(previousExportTransportTime)
             ? previousExportTransportTime
             : transportTime;
-        animationDelta = Math.min(0.1, Math.max(0, transportTime - previous));
+        // Clamped generously rather than at the 0.1 s used for live playback.
+        // During export the transport is the authority on elapsed time, and
+        // capping delta at 0.1 s made every frame slower than 10 fps advance the
+        // visuals less than the audio moved, so rotation and dissolve motion
+        // fell permanently behind the track.
+        animationDelta = Math.min(1, Math.max(0, transportTime - previous));
         previousExportTransportTime = transportTime;
     } else {
         animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
         previousAnimationTime = animationNow;
     }
 
-    animateDissolve();
+    animateDissolve(animationDelta);
     animateMeshRotation(animationDelta);
 
     // Apply the requested frequency mapping without changing the underlying
