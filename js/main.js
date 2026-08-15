@@ -2938,10 +2938,12 @@ let exportPreviousLoop = false;
 // Frame pacing state. While these are active the render loop runs on an even
 // 1/fps grid instead of whatever cadence requestAnimationFrame happens to give.
 let exportFrameInterval = 0;
-let exportNextFrameTime = 0;
 let exportVideoTrack = null;
-let exportManualFrameCapture = false;
-let exportFramesCaptured = 0;
+// Frame grid anchored to the audio clock. Frames are addressed by index from a
+// fixed origin so a slow frame can never re-phase the schedule.
+let exportFrameOrigin = 0;
+let exportFrameIndex = 0;
+let exportFramesRendered = 0;
 let exportBeganAt = 0;
 let previousExportTransportTime = null;
 const EXPORT_FRAME_TOLERANCE_MS = 1.5;
@@ -3213,11 +3215,22 @@ function updateExportModal() {
     if (refs.fill) refs.fill.style.width = `${(ratio * 100).toFixed(1)}%`;
     if (refs.percent) refs.percent.textContent = `${Math.round(ratio * 100)}%`;
     if (refs.time) refs.time.textContent = `${formatTime(elapsed)} / ${formatTime(span)}`;
-    if (refs.frames) refs.frames.textContent = `${exportFramesCaptured.toLocaleString()} frames`;
+    // Show rendered frames against the number the audio timeline calls for. The
+    // video track is captured on its own clock either way, so a shortfall means
+    // repeated frames rather than desync — but it tells the user the machine is
+    // not keeping up with the requested rate.
+    const expectedFrames = exportFrameInterval > 0
+        ? Math.max(0, Math.floor((elapsed * 1000) / exportFrameInterval))
+        : 0;
+    if (refs.frames) {
+        refs.frames.textContent = expectedFrames > 0
+            ? `${exportFramesRendered.toLocaleString()} / ${expectedFrames.toLocaleString()} frames`
+            : `${exportFramesRendered.toLocaleString()} frames`;
+    }
     if (refs.fps) {
         const wall = (performance.now() - exportBeganAt) / 1000;
-        const captureRate = wall > 0.5 ? exportFramesCaptured / wall : 0;
-        refs.fps.textContent = captureRate > 0 ? `${captureRate.toFixed(1)} fps captured` : '—';
+        const renderRate = wall > 0.5 ? exportFramesRendered / wall : 0;
+        refs.fps.textContent = renderRate > 0 ? `${renderRate.toFixed(1)} fps rendered` : '—';
     }
 }
 
@@ -3250,22 +3263,17 @@ async function startVideoExport() {
 
     const frameRate = Number(exportSettings.frameRate) || 60;
 
-    // captureStream(0) hands frame timing to us instead of letting the browser
-    // sample the canvas on its own schedule. Paired with the pacer in animate(),
-    // every encoded frame corresponds to exactly one render, evenly spaced in
-    // scene time. Left to itself the browser duplicates and drops frames around
-    // an uneven requestAnimationFrame cadence, which is what made rotating
-    // camera presets read as a lower frame rate.
-    let canvasStream = cnvs.captureStream(0);
-    let videoTrack = canvasStream.getVideoTracks()[0];
-    exportManualFrameCapture = Boolean(videoTrack && typeof videoTrack.requestFrame === 'function');
-    if (!exportManualFrameCapture) {
-        // Safari and older engines have no requestFrame; fall back to the timed
-        // capture, where the pacer still keeps render spacing even.
-        canvasStream.getTracks().forEach((track) => track.stop());
-        canvasStream = cnvs.captureStream(frameRate);
-        videoTrack = canvasStream.getVideoTracks()[0];
-    }
+    // Browser-timed capture. The track must own the video timeline: it runs on
+    // the same real-time clock as the recorded audio, so the two stay locked
+    // together no matter how fast the renderer manages to go.
+    //
+    // Driving it manually with captureStream(0) + requestFrame() tied the frame
+    // count to the render count instead. Whenever a frame slot was missed the
+    // video track received one frame fewer than the elapsed time called for,
+    // and since nothing ever made those frames up the video ran progressively
+    // ahead of the audio — the desync being reported here.
+    const canvasStream = cnvs.captureStream(frameRate);
+    const videoTrack = canvasStream.getVideoTracks()[0];
     if (videoTrack && 'contentHint' in videoTrack) videoTrack.contentHint = 'motion';
     exportVideoTrack = videoTrack || null;
     const tracks = videoTrack ? [videoTrack] : [];
@@ -3334,12 +3342,13 @@ async function startVideoExport() {
 function beginExportFramePacing(frameRate, synchronizedContextTime = null) {
     exportFrameInterval = frameRate > 0 ? 1000 / frameRate : 0;
     // Use the Web Audio clock during export. The audio source, FFT analyser and
-    // video frame cadence now share one monotonic timeline instead of mixing
+    // render cadence share one monotonic timeline instead of mixing
     // AudioContext.currentTime with performance.now().
-    exportNextFrameTime = audioContext && Number.isFinite(synchronizedContextTime)
+    exportFrameOrigin = audioContext && Number.isFinite(synchronizedContextTime)
         ? synchronizedContextTime * 1000
         : (audioContext ? audioContext.currentTime * 1000 : performance.now());
-    exportFramesCaptured = 0;
+    exportFrameIndex = 0;
+    exportFramesRendered = 0;
     exportBeganAt = performance.now();
     previousExportTransportTime = exportStartAt;
 }
@@ -3347,7 +3356,6 @@ function beginExportFramePacing(frameRate, synchronizedContextTime = null) {
 
 function endExportFramePacing() {
     exportFrameInterval = 0;
-    exportNextFrameTime = 0;
     if (exportVideoTrack) {
         try {
             exportVideoTrack.stop();
@@ -3356,7 +3364,8 @@ function endExportFramePacing() {
         }
     }
     exportVideoTrack = null;
-    exportManualFrameCapture = false;
+    exportFrameOrigin = 0;
+    exportFrameIndex = 0;
     previousExportTransportTime = null;
 }
 
@@ -3807,14 +3816,18 @@ function animate() {
     // the encoder evenly spaced scene time, which is what rotation needs.
     if (exportFrameInterval > 0) {
         const exportClockNow = audioContext ? audioContext.currentTime * 1000 : animationNow;
-        if (exportClockNow + EXPORT_FRAME_TOLERANCE_MS < exportNextFrameTime) {
+        // Frame slots are addressed by index from a fixed origin rather than by
+        // repeatedly advancing a "next frame" stamp. The previous form clamped
+        // that stamp forward to the current time after every late frame, which
+        // silently re-phased the render grid against the audio clock and let the
+        // two drift apart over a long export. Deriving the slot from the origin
+        // means a slow frame skips whole slots and the grid stays anchored.
+        const dueIndex = Math.floor((exportClockNow - exportFrameOrigin + EXPORT_FRAME_TOLERANCE_MS) / exportFrameInterval);
+        if (dueIndex < exportFrameIndex) {
             requestAnimationFrame(animate);
             return;
         }
-        // Clamping to the shared audio clock prevents backlog catch-up bursts
-        // while keeping each captured frame timestamped against the same clock
-        // that advances the recorded audio track.
-        exportNextFrameTime = Math.max(exportClockNow, exportNextFrameTime + exportFrameInterval);
+        exportFrameIndex = dueIndex + 1;
     }
 
     const transportTime = exportFrameInterval > 0 ? getTransportTime() : null;
@@ -3920,10 +3933,7 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
-    if (mediaRecorder?.state === 'recording') {
-        if (exportManualFrameCapture && exportVideoTrack) exportVideoTrack.requestFrame();
-        exportFramesCaptured++;
-    }
+    if (mediaRecorder?.state === 'recording') exportFramesRendered++;
 
     if (mediaRecorder?.state === 'recording' && exportStopAt != null && getTransportTime() >= exportStopAt - 0.02) {
         pauseTransport();
