@@ -9,7 +9,7 @@ import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { TAARenderPass } from 'three/addons/postprocessing/TAARenderPass.js';
-import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-hdr-taa-1';
+import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-hdr-taa-2';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -1885,17 +1885,23 @@ function createEnvironmentSource(image) {
 // PMREMGenerator treats any non-cube texture as equirectangular, so the
 // background texture itself needs no mapping change and scene.background keeps
 // rendering exactly as before.
-// Twelve HDR panoramas make an unbounded cache expensive, so keep only the
-// most recently used targets and dispose the rest.
-const MAX_CACHED_ENVIRONMENTS = 4;
+// Equirectangular textures cannot be used directly as scene.background. In
+// r172 WebGLBackground only takes the environment-projected path for a
+// CubeTexture or a CubeUVReflectionMapping texture; anything else falls through
+// to a flat PlaneGeometry, which squashes the whole 2:1 panorama across the
+// screen. So each panorama is converted to a real cube render target for the
+// backdrop, and PMREM'd separately for reflections.
+const MAX_CACHED_ENVIRONMENTS = 3;
 
 function trimEnvironmentCache() {
     while (backgroundEnvironmentCache.size > MAX_CACHED_ENVIRONMENTS) {
         const oldestKey = backgroundEnvironmentCache.keys().next().value;
+        if (oldestKey === currentBackgroundName) break;
         const oldest = backgroundEnvironmentCache.get(oldestKey);
         backgroundEnvironmentCache.delete(oldestKey);
         try {
-            oldest?.dispose?.();
+            oldest?.pmrem?.dispose?.();
+            oldest?.cubeTarget?.dispose?.();
         } catch (error) {
             console.warn('Environment target could not be disposed.', error);
         }
@@ -1908,7 +1914,7 @@ function getBackgroundEnvironment(name, texture) {
         // Re-insert so the most recently used entry is last in the map.
         backgroundEnvironmentCache.delete(name);
         backgroundEnvironmentCache.set(name, cached);
-        return cached.texture;
+        return cached;
     }
 
     const image = texture.image;
@@ -1922,11 +1928,25 @@ function getBackgroundEnvironment(name, texture) {
     // bounded 256px cube either way.
     const isDataTexture = Boolean(texture.isDataTexture);
     const source = isDataTexture ? texture : createEnvironmentSource(image);
+
+    let entry = null;
     try {
-        const target = pmremGenerator.fromEquirectangular(source);
-        backgroundEnvironmentCache.set(name, target);
+        const pmrem = pmremGenerator.fromEquirectangular(source);
+
+        // Backdrop resolution is independent of the reflection map: half the
+        // panorama width per cube face keeps the visible backdrop as sharp as
+        // the source allows without a PMREM-sized blur.
+        let cubeTarget = null;
+        if (texture.mapping === THREE.EquirectangularReflectionMapping) {
+            const faceSize = clamp(Math.round((image.width || 1024) / 2), 256, 1024);
+            cubeTarget = new THREE.WebGLCubeRenderTarget(faceSize);
+            cubeTarget.fromEquirectangularTexture(re, texture);
+        }
+
+        entry = { pmrem, cubeTarget, environmentTexture: pmrem.texture, backgroundTexture: cubeTarget?.texture || null };
+        backgroundEnvironmentCache.set(name, entry);
         trimEnvironmentCache();
-        return target.texture;
+        return entry;
     } finally {
         if (!isDataTexture) source.dispose();
     }
@@ -1981,20 +2001,24 @@ async function loadBackground(name) {
             defaultEnvironmentTexture = texture;
         }
 
-        activeBackgroundTexture = texture;
         currentBackgroundName = name;
-        scene.background = texture;
         if (preset.type === 'cube') {
             cubeTexture = texture;
+            activeBackgroundTexture = texture;
+            scene.background = texture;
             scene.environment = texture;
         } else {
-            let environment = null;
+            let entry = null;
             try {
-                environment = getBackgroundEnvironment(name, texture);
+                entry = getBackgroundEnvironment(name, texture);
             } catch (environmentError) {
                 console.warn(`Environment map could not be generated for ${name}.`, environmentError);
             }
-            scene.environment = environment || defaultEnvironmentTexture || cubeTexture;
+            // Fall back to the raw texture only if the conversion failed; a flat
+            // backdrop is still better than none.
+            activeBackgroundTexture = entry?.backgroundTexture || texture;
+            scene.background = activeBackgroundTexture;
+            scene.environment = entry?.environmentTexture || defaultEnvironmentTexture || cubeTexture;
         }
 
         cubeCamera.update(re, scene);
