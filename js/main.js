@@ -108,8 +108,19 @@ const re = new THREE.WebGLRenderer({ canvas: cnvs, antialias: true });
 const displayPixelRatio = Math.min(window.devicePixelRatio, 2);
 re.setPixelRatio(displayPixelRatio);
 re.setSize(cnvs.clientWidth * scale, cnvs.clientHeight * scale, false);
-re.toneMapping = THREE.CineonToneMapping;
+re.toneMapping = THREE.ACESFilmicToneMapping;
+re.toneMappingExposure = 1.1;
 re.outputColorSpace = THREE.SRGBColorSpace;
+
+// Subtle studio lights complement the environment map. They create readable
+// specular shape cues without replacing the selected background/reflections.
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.1);
+keyLight.position.set(6, 8, 10);
+scene.add(keyLight);
+
+const rimLight = new THREE.DirectionalLight(0x9fc5ff, 1.25);
+rimLight.position.set(-8, 3, -7);
+scene.add(rimLight);
 
 
 const effectComposer1 = new EffectComposer(re);
@@ -2021,6 +2032,15 @@ phyMat.metalness = 2.0;
 phyMat.roughness = 0.0;
 phyMat.side = THREE.DoubleSide;
 
+const visualSettings = {
+    exposure: 1.1,
+    environmentIntensity: 1.15,
+    roughnessVariation: 0.055,
+    roughnessScale: 0.8,
+    keyLightIntensity: 2.1,
+    rimLightIntensity: 1.25,
+};
+
 // Surface presets. Only appearance properties are touched — colour, side and
 // the dissolve shader injection stay under their existing controls. 'Metallic'
 // reproduces the original material exactly.
@@ -2031,9 +2051,9 @@ const materialDefaults = {
 
 const materialPresets = {
     'Metallic': {
-        metalness: 2.0, roughness: 0.0, transmission: 0.0, thickness: 0.0,
-        ior: 1.5, iridescence: 0.0, clearcoat: 0.0, clearcoatRoughness: 0.0,
-        specularIntensity: 1.0, envMapIntensity: 1.0,
+        metalness: 1.0, roughness: 0.09, transmission: 0.0, thickness: 0.0,
+        ior: 1.5, iridescence: 0.0, clearcoat: 0.18, clearcoatRoughness: 0.08,
+        specularIntensity: 1.0, envMapIntensity: 1.25,
         attenuationDistance: Infinity, attenuationColor: 0xffffff,
     },
     'Chrome': {
@@ -2093,7 +2113,7 @@ function applyMaterialPreset(name) {
     phyMat.clearcoat = preset.clearcoat;
     phyMat.clearcoatRoughness = preset.clearcoatRoughness;
     phyMat.specularIntensity = preset.specularIntensity;
-    phyMat.envMapIntensity = preset.envMapIntensity;
+    phyMat.envMapIntensity = preset.envMapIntensity * visualSettings.environmentIntensity;
     phyMat.attenuationDistance = preset.attenuationDistance;
     phyMat.attenuationColor.set(preset.attenuationColor);
 
@@ -2106,6 +2126,20 @@ function applyMaterialPreset(name) {
 
     if (needsRecompile) phyMat.needsUpdate = true;
     currentMaterialName = name;
+}
+
+function applyVisualSettings() {
+    re.toneMappingExposure = visualSettings.exposure;
+    keyLight.intensity = visualSettings.keyLightIntensity;
+    rimLight.intensity = visualSettings.rimLightIntensity;
+    dissolveUniformData.uRoughnessVariation.value = visualSettings.roughnessVariation;
+    dissolveUniformData.uRoughnessScale.value = visualSettings.roughnessScale;
+
+    const preset = materialPresets[currentMaterialName];
+    if (preset) phyMat.envMapIntensity = preset.envMapIntensity * visualSettings.environmentIntensity;
+    if (typeof innerMat !== 'undefined' && innerMat) {
+        innerMat.envMapIntensity = 0.55 * visualSettings.environmentIntensity;
+    }
 }
 
 
@@ -2133,6 +2167,24 @@ const dissolveUniformData = {
     },
     uEdgeBloomBoost: {
         value: 1.0
+    },
+    uEdgeCoreColor: {
+        value: new THREE.Color(0xe8f6ff)
+    },
+    uEdgeCoreWidth: {
+        value: 0.22
+    },
+    uEdgeIntensity: {
+        value: 1.65
+    },
+    uEdgeSoftness: {
+        value: 1.45
+    },
+    uRoughnessVariation: {
+        value: visualSettings.roughnessVariation
+    },
+    uRoughnessScale: {
+        value: visualSettings.roughnessScale
     }
 }
 
@@ -2167,8 +2219,21 @@ function setupDissolveShader(shader) {
         uniform vec3 uMotionOffset;
         uniform vec3 uEdgeColor;
         uniform float uEdgeBloomBoost;
+        uniform vec3 uEdgeCoreColor;
+        uniform float uEdgeCoreWidth;
+        uniform float uEdgeIntensity;
+        uniform float uEdgeSoftness;
+        uniform float uRoughnessVariation;
+        uniform float uRoughnessScale;
 
         ${snoise}
+    `);
+
+    // Small-scale roughness variation gives reflections real surface breakup
+    // without changing the silhouette or adding expensive texture assets.
+    shader.fragmentShader = shader.fragmentShader.replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+        float surfaceRoughnessNoise = snoise(vPos * uRoughnessScale);
+        roughnessFactor = clamp(roughnessFactor + surfaceRoughnessNoise * uRoughnessVariation, 0.02, 1.0);
     `);
 
     // Apply the dissolve before Three.js tone mapping / output-color conversion.
@@ -2202,10 +2267,15 @@ function setupDissolveShader(shader) {
 
         float edgeWidth = uProgress + uEdge;
         if(noise > uProgress && noise < edgeWidth){
-            // Replace the lit surface with the emissive dissolve color while the
-            // value is still linear/HDR. The normal opaque, tone-mapping and
-            // color-space chunks below now process screen and exported frames alike.
-            outgoingLight = uEdgeColor * uEdgeBloomBoost;
+            // Layer the boundary into a white-hot inner core and a softer colored
+            // outer falloff. UnrealBloomPass turns the HDR intensity into the
+            // visible halo while the material remains export-safe.
+            float edgeT = clamp((noise - uProgress) / max(uEdge, 0.0001), 0.0, 1.0);
+            float outerFalloff = pow(max(0.0, 1.0 - edgeT), max(0.15, uEdgeSoftness));
+            float core = 1.0 - smoothstep(0.0, max(0.01, uEdgeCoreWidth), edgeT);
+            vec3 layeredEdgeColor = mix(uEdgeColor, uEdgeCoreColor, core);
+            float layeredIntensity = uEdgeIntensity * (0.45 + outerFalloff * 1.35) + core * 1.85;
+            outgoingLight = layeredEdgeColor * layeredIntensity * uEdgeBloomBoost;
             diffuseColor.a = 1.0;
         }
 
@@ -2224,11 +2294,88 @@ phyMat.onBeforeCompile = (shader) => {
 mesh = new THREE.Mesh(meshGeo, phyMat);
 scene.add(mesh);
 
+// A slightly inset secondary shell gives dissolved regions physical depth rather
+// than revealing the background immediately. It uses the same moving dissolve
+// field but survives one additional noise band behind the outer surface.
+const innerUniformData = {
+    uProgress: dissolveUniformData.uProgress,
+    uFreq: dissolveUniformData.uFreq,
+    uAmp: dissolveUniformData.uAmp,
+    uMotionAngle: dissolveUniformData.uMotionAngle,
+    uMotionOffset: dissolveUniformData.uMotionOffset,
+    uInnerDepth: { value: 2.25 },
+    uInnerColor: { value: new THREE.Color(0x2aa7ff) },
+    uInnerIntensity: { value: 1.35 },
+};
+
+const innerMat = new THREE.MeshPhysicalMaterial({
+    color: 0x071019,
+    metalness: 0.35,
+    roughness: 0.46,
+    clearcoat: 0.2,
+    clearcoatRoughness: 0.22,
+    side: THREE.DoubleSide,
+    envMapIntensity: 0.55 * visualSettings.environmentIntensity,
+});
+
+function setupInnerShellShader(shader) {
+    setupUniforms(shader, innerUniformData);
+    shader.vertexShader = shader.vertexShader.replace('#include <common>', `#include <common>
+        varying vec3 vInnerPos;
+    `);
+    shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `#include <begin_vertex>
+        vInnerPos = transformed;
+    `);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <common>', `#include <common>
+        varying vec3 vInnerPos;
+        uniform float uProgress;
+        uniform float uFreq;
+        uniform float uAmp;
+        uniform float uMotionAngle;
+        uniform vec3 uMotionOffset;
+        uniform float uInnerDepth;
+        uniform vec3 uInnerColor;
+        uniform float uInnerIntensity;
+        ${snoise}
+    `);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <opaque_fragment>', `
+        float innerMotionCos = cos(uMotionAngle);
+        float innerMotionSin = sin(uMotionAngle);
+        vec3 innerRotated = vec3(
+            innerMotionCos * vInnerPos.x - innerMotionSin * vInnerPos.z,
+            vInnerPos.y,
+            innerMotionSin * vInnerPos.x + innerMotionCos * vInnerPos.z
+        );
+        float innerTiltAngle = uMotionAngle * 0.73;
+        float innerTiltCos = cos(innerTiltAngle);
+        float innerTiltSin = sin(innerTiltAngle);
+        vec3 innerTilted = vec3(
+            innerRotated.x,
+            innerTiltCos * innerRotated.y - innerTiltSin * innerRotated.z,
+            innerTiltSin * innerRotated.y + innerTiltCos * innerRotated.z
+        );
+        float innerNoise = snoise((innerTilted + uMotionOffset) * uFreq) * uAmp;
+        if(innerNoise < uProgress - uInnerDepth) discard;
+        float innerBand = clamp((innerNoise - (uProgress - uInnerDepth)) / max(0.001, uInnerDepth), 0.0, 1.0);
+        outgoingLight += uInnerColor * uInnerIntensity * (1.0 - innerBand * 0.45);
+        #include <opaque_fragment>
+    `);
+}
+innerMat.onBeforeCompile = setupInnerShellShader;
+
+let innerShellScale = 0.965;
+let innerMesh = new THREE.Mesh(meshGeo, innerMat);
+innerMesh.scale.setScalar(innerShellScale);
+scene.add(innerMesh);
+
+applyVisualSettings();
+applyMaterialPreset(currentMaterialName);
 
 let particleMesh;
 let particleMat = new THREE.ShaderMaterial();
 particleMat.transparent = true;
 particleMat.blending = THREE.AdditiveBlending;
+particleMat.depthWrite = false;
 let particleCount = meshGeo.attributes.position.count;
 let particleMaxOffsetArr; // -- how far a particle can go from its initial position 
 let particleInitPosArr; // store the initial position of the particles -- particle position will reset here if it exceed maxoffset
@@ -2236,6 +2383,7 @@ let particleCurrPosArr; // use to update he position of the particle
 let particleVelocityArr; // velocity of each particle
 let particleDistArr;
 let particleRotationArr;
+let particleNormalArr;
 // Stable per-particle randoms. Keeping the raw values lets Lifetime and Count be
 // re-derived without reshuffling, so changing either never scrambles the swarm.
 let particleLifeRandArr;
@@ -2246,6 +2394,7 @@ let particleData = {
     waveAmplitude: 0,
     particleCountRatio: 1,
     particleLifetime: 1,
+    boundaryPush: 0.72,
 }
 
 
@@ -2257,6 +2406,7 @@ function initParticleAttributes(meshGeo) {
     particleVelocityArr = new Float32Array(particleCount * 3);
     particleDistArr = new Float32Array(particleCount);
     particleRotationArr = new Float32Array(particleCount);
+    particleNormalArr = new Float32Array(meshGeo.getAttribute('normal').array);
     particleLifeRandArr = new Float32Array(particleCount);
     particleSeedArr = new Float32Array(particleCount);
 
@@ -2346,9 +2496,16 @@ function updateParticleAttributes() {
             Math.sin(posx * 5) * (0.6 + waveAmplitude) +
             Math.sin(posx * 7) * (0.6 + waveAmplitude);
 
-        const vx = (particleVelocityArr[x] * velocityX + xwave) * speed;
-        const vy = (particleVelocityArr[y] * velocityY + ywave) * speed;
-        const vz = particleVelocityArr[z] * speed;
+        // Emit away from the current dissolve boundary first, then let the
+        // existing turbulence carry the particle. Mesh normals make this work
+        // consistently across spheres, knots, boxes and every other mesh option.
+        const normalPush = particleData.boundaryPush * 4.0;
+        const nx = particleNormalArr[x] || 0;
+        const ny = particleNormalArr[y] || 0;
+        const nz = particleNormalArr[z] || 0;
+        const vx = (nx * normalPush + particleVelocityArr[x] * velocityX + xwave * 0.28) * speed;
+        const vy = (ny * normalPush + particleVelocityArr[y] * velocityY + ywave * 0.28) * speed;
+        const vz = (nz * normalPush + particleVelocityArr[z]) * speed;
 
         particleCurrPosArr[x] += vx;
         particleCurrPosArr[y] += vy;
@@ -2424,9 +2581,11 @@ particleMat.vertexShader = `
     varying float vNoise;
     varying float vAngle;
     varying float vActive;
+    varying float vLife;
 
     attribute vec3 aCurrentPos;
     attribute float aDist;
+    attribute float aOffset;
     attribute float aAngle;
     attribute float aSeed;
 
@@ -2471,8 +2630,10 @@ particleMat.vertexShader = `
         vec4 projectedPosition = projectionMatrix * viewPosition;
         gl_Position = projectedPosition;
 
+        vLife = clamp(1.0 - (aDist / max(aOffset, 0.001)), 0.0, 1.0);
         float size = uBaseSize * uPixelDensity;
-        size = size  / (aDist + 1.0);
+        size = size / (aDist + 1.0);
+        size *= mix(0.3, 1.0, vLife);
         gl_PointSize = (size / -viewPosition.z) * vActive;
 }
 `;
@@ -2486,11 +2647,13 @@ particleMat.fragmentShader = `
     varying float vNoise;
     varying float vAngle;
     varying float vActive;
+    varying float vLife;
 
     void main(){
         // Some drivers clamp gl_PointSize up to 1.0, so the count gate is
         // enforced here as well as in the vertex stage.
         if( vActive < 0.5 ) discard;
+        if( vLife <= 0.01 ) discard;
         if( vNoise < uProgress ) discard;
         if( vNoise > uProgress + uEdge) discard;
 
@@ -2501,7 +2664,7 @@ particleMat.fragmentShader = `
 
         vec4 texture = texture2D(uTexture,coord);
 
-        gl_FragColor = vec4(vec3(uColor.xyz * texture.xyz),1.0);
+        gl_FragColor = vec4(uColor.xyz * texture.xyz * vLife, texture.a * vLife);
     }
 `;
 
@@ -2552,6 +2715,14 @@ let tweaks = {
     meshVisible: true,
     meshColor: "#" + phyMat.color.getHexString(),
     edgeColor: "#" + dissolveUniformData.uEdgeColor.value.getHexString(),
+    edgeCoreColor: "#" + dissolveUniformData.uEdgeCoreColor.value.getHexString(),
+    edgeCoreWidth: dissolveUniformData.uEdgeCoreWidth.value,
+    edgeIntensity: dissolveUniformData.uEdgeIntensity.value,
+    edgeSoftness: dissolveUniformData.uEdgeSoftness.value,
+    innerDepth: innerUniformData.uInnerDepth.value,
+    innerColor: "#" + innerUniformData.uInnerColor.value.getHexString(),
+    innerIntensity: innerUniformData.uInnerIntensity.value,
+    innerScale: innerShellScale,
     autoDissolve: false,
 
     particleVisible: true,
@@ -2562,6 +2733,7 @@ let tweaks = {
     waveAmplitude: particleData.waveAmplitude,
     particleCountPercent: particleData.particleCountRatio * 100,
     particleLifetime: particleData.particleLifetime,
+    particleBoundaryPush: particleData.boundaryPush,
     particleActiveCount: particleCount,
 
     bloomStrength: unrealBloomPass.strength,
@@ -2592,19 +2764,24 @@ let currentBackgroundName = 'Original';
 
 function handleMeshChange(geo, name = null) {
     scene.remove(mesh);
+    scene.remove(innerMesh);
     scene.remove(particleMesh);
 
     meshGeo = geo;
     mesh = new THREE.Mesh(geo, phyMat);
+    innerMesh = new THREE.Mesh(geo, innerMat);
+    innerMesh.scale.setScalar(tweaks?.innerScale ?? innerShellScale);
 
     initParticleAttributes(geo);
     particleMesh = new THREE.Points(geo, particleMat);
     mesh.visible = tweaks?.meshVisible ?? true;
+    innerMesh.visible = tweaks?.meshVisible ?? true;
     particleMesh.visible = tweaks?.particleVisible ?? true;
     if (tweaks) {
-        mesh.rotation.y = particleMesh.rotation.y = tweaks.rotationY;
+        mesh.rotation.y = innerMesh.rotation.y = particleMesh.rotation.y = tweaks.rotationY;
     }
 
+    scene.add(innerMesh);
     scene.add(mesh);
     scene.add(particleMesh);
     if (name) currentMeshName = name;
@@ -2866,6 +3043,7 @@ function collectSettings() {
         material: currentMaterialName,
         viewport: { ...viewportSettings },
         camera: { ...cameraSettings },
+        visual: { ...visualSettings },
         audioReactive: { ...audioReactive },
         audioResolution: audioSettings.fftSize,
         loop: { ...loopSettings },
@@ -2877,6 +3055,14 @@ function collectSettings() {
             meshVisible: tweaks.meshVisible,
             meshColor: tweaks.meshColor,
             edgeColor: tweaks.edgeColor,
+            edgeCoreColor: tweaks.edgeCoreColor,
+            edgeCoreWidth: tweaks.edgeCoreWidth,
+            edgeIntensity: tweaks.edgeIntensity,
+            edgeSoftness: tweaks.edgeSoftness,
+            innerDepth: tweaks.innerDepth,
+            innerColor: tweaks.innerColor,
+            innerIntensity: tweaks.innerIntensity,
+            innerScale: tweaks.innerScale,
             autoDissolve: tweaks.autoDissolve,
         },
         particle: {
@@ -2888,6 +3074,7 @@ function collectSettings() {
             waveAmplitude: tweaks.waveAmplitude,
             particleCountPercent: tweaks.particleCountPercent,
             particleLifetime: tweaks.particleLifetime,
+            particleBoundaryPush: tweaks.particleBoundaryPush,
         },
         bloomStrength: tweaks.bloomStrength,
         rotationY: tweaks.rotationY,
@@ -2914,6 +3101,10 @@ async function applyImportedSettings(data) {
     if (data.loop) Object.assign(loopSettings, data.loop);
     if (data.viewport) Object.assign(viewportSettings, data.viewport);
     if (data.camera) Object.assign(cameraSettings, data.camera);
+    if (data.visual) {
+        Object.assign(visualSettings, data.visual);
+        applyVisualSettings();
+    }
     if (data.dissolve) {
         Object.assign(tweaks, data.dissolve);
         dissolveUniformData.uProgress.value = tweaks.dissolveProgress;
@@ -2922,7 +3113,15 @@ async function applyImportedSettings(data) {
         dissolveUniformData.uFreq.value = tweaks.frequency;
         phyMat.color.set(tweaks.meshColor);
         dissolveUniformData.uEdgeColor.value.set(tweaks.edgeColor);
-        mesh.visible = tweaks.meshVisible;
+        dissolveUniformData.uEdgeCoreColor.value.set(tweaks.edgeCoreColor);
+        dissolveUniformData.uEdgeCoreWidth.value = tweaks.edgeCoreWidth;
+        dissolveUniformData.uEdgeIntensity.value = tweaks.edgeIntensity;
+        dissolveUniformData.uEdgeSoftness.value = tweaks.edgeSoftness;
+        innerUniformData.uInnerDepth.value = tweaks.innerDepth;
+        innerUniformData.uInnerColor.value.set(tweaks.innerColor);
+        innerUniformData.uInnerIntensity.value = tweaks.innerIntensity;
+        innerShellScale = tweaks.innerScale;
+        mesh.visible = innerMesh.visible = tweaks.meshVisible;
     }
     if (data.particle) {
         Object.assign(tweaks, data.particle);
@@ -2939,6 +3138,9 @@ async function applyImportedSettings(data) {
             particleData.particleLifetime = tweaks.particleLifetime;
             applyParticleLifetime();
         }
+        if (Number.isFinite(data.particle.particleBoundaryPush)) {
+            particleData.boundaryPush = tweaks.particleBoundaryPush;
+        }
         particleMesh.visible = tweaks.particleVisible;
         syncParticleCountReadout();
     }
@@ -2948,7 +3150,7 @@ async function applyImportedSettings(data) {
     }
     if (Number.isFinite(data.rotationY)) {
         tweaks.rotationY = data.rotationY;
-        mesh.rotation.y = particleMesh.rotation.y = data.rotationY;
+        mesh.rotation.y = innerMesh.rotation.y = particleMesh.rotation.y = data.rotationY;
     }
     if (typeof data.meshAutoRotate === 'boolean') tweaks.meshAutoRotate = data.meshAutoRotate;
     if (Number.isFinite(data.meshRotationSpeed)) tweaks.meshRotationSpeed = data.meshRotationSpeed;
@@ -3073,6 +3275,7 @@ const sectionDefaults = {
     audioMuted: audioInfo.muted,
     viewport: { ...viewportSettings },
     camera: { ...cameraSettings },
+    visual: { ...visualSettings },
     background: currentBackgroundName,
     meshName: geoNames[0],
     materialName: currentMaterialName,
@@ -3091,6 +3294,14 @@ const sectionDefaults = {
         amplitude: tweaks.amplitude,
         meshColor: tweaks.meshColor,
         edgeColor: tweaks.edgeColor,
+        edgeCoreColor: tweaks.edgeCoreColor,
+        edgeCoreWidth: tweaks.edgeCoreWidth,
+        edgeIntensity: tweaks.edgeIntensity,
+        edgeSoftness: tweaks.edgeSoftness,
+        innerDepth: tweaks.innerDepth,
+        innerColor: tweaks.innerColor,
+        innerIntensity: tweaks.innerIntensity,
+        innerScale: tweaks.innerScale,
     },
     particle: {
         particleVisible: tweaks.particleVisible,
@@ -3101,6 +3312,7 @@ const sectionDefaults = {
         velocityFactor: { ...particleData.velocityFactor },
         particleCountPercent: tweaks.particleCountPercent,
         particleLifetime: tweaks.particleLifetime,
+        particleBoundaryPush: tweaks.particleBoundaryPush,
     },
     exportSettings: { ...exportSettings },
 };
@@ -3307,6 +3519,19 @@ async function initControls() {
         const materialBlade = createTweakList(meshFolder, 'Material', materialNames, materialNames);
         materialBlade.value = currentMaterialName;
         materialBlade.on('change', (event) => applyMaterialPreset(event.value));
+
+        const lightingFolder = meshFolder.addFolder({ title: 'Lighting & Surface', expanded: false });
+        lightingFolder.addBinding(visualSettings, 'exposure', { min: 0.35, max: 2.5, step: 0.01, label: 'Exposure' }).on('change', applyVisualSettings);
+        lightingFolder.addBinding(visualSettings, 'environmentIntensity', { min: 0, max: 3, step: 0.01, label: 'Environment' }).on('change', applyVisualSettings);
+        lightingFolder.addBinding(visualSettings, 'roughnessVariation', { min: 0, max: 0.35, step: 0.001, label: 'Roughness Variation' }).on('change', applyVisualSettings);
+        lightingFolder.addBinding(visualSettings, 'roughnessScale', { min: 0.05, max: 4, step: 0.01, label: 'Roughness Scale' }).on('change', applyVisualSettings);
+        lightingFolder.addBinding(visualSettings, 'keyLightIntensity', { min: 0, max: 8, step: 0.05, label: 'Key Light' }).on('change', applyVisualSettings);
+        lightingFolder.addBinding(visualSettings, 'rimLightIntensity', { min: 0, max: 8, step: 0.05, label: 'Rim Light' }).on('change', applyVisualSettings);
+        addResetButton(lightingFolder, () => {
+            Object.assign(visualSettings, sectionDefaults.visual);
+            applyVisualSettings();
+        });
+
         meshFolder.addBinding(tweaks, 'bloomStrength', { min: 0, max: 5, step: 0.01, label: 'Bloom Strength' }).on('change', (event) => {
             unrealBloomPass.strength = event.value;
         });
@@ -3314,18 +3539,18 @@ async function initControls() {
         meshFolder.addBinding(tweaks, 'meshRotationSpeed', { min: -3, max: 3, step: 0.01, label: 'Rotate Speed' });
         rotationYBinding = meshFolder.addBinding(tweaks, 'rotationY', { min: -(Math.PI * 2), max: (Math.PI * 2), step: 0.01, label: 'Rotation Y' }).on('change', (event) => {
             if (suppressRotationYChange) return;
-            particleMesh.rotation.y = mesh.rotation.y = event.value;
+            particleMesh.rotation.y = innerMesh.rotation.y = mesh.rotation.y = event.value;
         });
         addResetButton(meshFolder, () => {
             meshBlade.value = geometries[geoNames.indexOf(sectionDefaults.meshName)];
             materialBlade.value = sectionDefaults.materialName;
             Object.assign(tweaks, sectionDefaults.mesh);
             unrealBloomPass.strength = tweaks.bloomStrength;
-            particleMesh.rotation.y = mesh.rotation.y = tweaks.rotationY;
+            particleMesh.rotation.y = innerMesh.rotation.y = mesh.rotation.y = tweaks.rotationY;
         });
 
         const dissolveFolder = controller.addFolder({ title: 'Dissolve Effect', expanded: false });
-        dissolveFolder.addBinding(tweaks, 'meshVisible', { label: 'Visible' }).on('change', (event) => { mesh.visible = event.value; });
+        dissolveFolder.addBinding(tweaks, 'meshVisible', { label: 'Visible' }).on('change', (event) => { mesh.visible = innerMesh.visible = event.value; });
         progressBinding = dissolveFolder.addBinding(tweaks, 'dissolveProgress', { min: -20, max: 20, step: 0.0001, label: 'Progress' }).on('change', (event) => { dissolveUniformData.uProgress.value = event.value; });
         dissolveFolder.addBinding(tweaks, 'autoDissolve', { label: 'Auto Animate' });
         dissolveFolder.addBinding(tweaks, 'edgeWidth', { min: 0.1, max: 8, step: 0.001, label: 'Edge Width' }).on('change', (event) => { dissolveUniformData.uEdge.value = event.value; });
@@ -3333,6 +3558,14 @@ async function initControls() {
         dissolveFolder.addBinding(tweaks, 'amplitude', { min: 0.1, max: 20, step: 0.001, label: 'Amplitude' }).on('change', (event) => { dissolveUniformData.uAmp.value = event.value; });
         dissolveFolder.addBinding(tweaks, 'meshColor', { label: 'Mesh Color' }).on('change', (event) => { phyMat.color.set(event.value); });
         dissolveFolder.addBinding(tweaks, 'edgeColor', { label: 'Edge Color' }).on('change', (event) => { dissolveUniformData.uEdgeColor.value.set(event.value); });
+        dissolveFolder.addBinding(tweaks, 'edgeCoreColor', { label: 'Core Color' }).on('change', (event) => { dissolveUniformData.uEdgeCoreColor.value.set(event.value); });
+        dissolveFolder.addBinding(tweaks, 'edgeCoreWidth', { min: 0.02, max: 0.8, step: 0.01, label: 'Core Width' }).on('change', (event) => { dissolveUniformData.uEdgeCoreWidth.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'edgeIntensity', { min: 0.1, max: 6, step: 0.01, label: 'Edge Intensity' }).on('change', (event) => { dissolveUniformData.uEdgeIntensity.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'edgeSoftness', { min: 0.15, max: 4, step: 0.01, label: 'Edge Falloff' }).on('change', (event) => { dissolveUniformData.uEdgeSoftness.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'innerDepth', { min: 0.1, max: 8, step: 0.01, label: 'Inner Depth' }).on('change', (event) => { innerUniformData.uInnerDepth.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'innerColor', { label: 'Inner Color' }).on('change', (event) => { innerUniformData.uInnerColor.value.set(event.value); });
+        dissolveFolder.addBinding(tweaks, 'innerIntensity', { min: 0, max: 6, step: 0.01, label: 'Inner Glow' }).on('change', (event) => { innerUniformData.uInnerIntensity.value = event.value; });
+        dissolveFolder.addBinding(tweaks, 'innerScale', { min: 0.88, max: 0.995, step: 0.001, label: 'Inner Scale' }).on('change', (event) => { innerShellScale = event.value; });
         addResetButton(dissolveFolder, () => {
             Object.assign(tweaks, sectionDefaults.dissolve);
             dissolveUniformData.uProgress.value = tweaks.dissolveProgress;
@@ -3340,8 +3573,16 @@ async function initControls() {
             dissolveUniformData.uFreq.value = tweaks.frequency;
             dissolveUniformData.uAmp.value = tweaks.amplitude;
             dissolveUniformData.uEdgeColor.value.set(tweaks.edgeColor);
+            dissolveUniformData.uEdgeCoreColor.value.set(tweaks.edgeCoreColor);
+            dissolveUniformData.uEdgeCoreWidth.value = tweaks.edgeCoreWidth;
+            dissolveUniformData.uEdgeIntensity.value = tweaks.edgeIntensity;
+            dissolveUniformData.uEdgeSoftness.value = tweaks.edgeSoftness;
+            innerUniformData.uInnerDepth.value = tweaks.innerDepth;
+            innerUniformData.uInnerColor.value.set(tweaks.innerColor);
+            innerUniformData.uInnerIntensity.value = tweaks.innerIntensity;
+            innerShellScale = tweaks.innerScale;
             phyMat.color.set(tweaks.meshColor);
-            mesh.visible = tweaks.meshVisible;
+            mesh.visible = innerMesh.visible = tweaks.meshVisible;
         });
 
         const particleFolder = controller.addFolder({ title: 'Particle Motion', expanded: false });
@@ -3350,6 +3591,7 @@ async function initControls() {
         particleFolder.addBinding(tweaks, 'particleColor', { label: 'Color' }).on('change', (event) => { particlesUniformData.uColor.value.set(event.value); });
         particleFolder.addBinding(tweaks, 'particleSpeedFactor', { min: 0.001, max: 0.1, step: 0.001, label: 'Speed' }).on('change', (event) => { particleData.particleSpeedFactor = event.value; });
         particleFolder.addBinding(tweaks, 'waveAmplitude', { min: 0, max: 5, step: 0.01, label: 'Wave Amplitude' }).on('change', (event) => { particleData.waveAmplitude = event.value; });
+        particleFolder.addBinding(tweaks, 'particleBoundaryPush', { min: 0, max: 3, step: 0.01, label: 'Boundary Push' }).on('change', (event) => { particleData.boundaryPush = event.value; });
         particleFolder.addBinding(tweaks, 'velocityFactor', { expanded: true, picker: 'inline', label: 'Velocity Factor' }).on('change', (event) => { particleData.velocityFactor = event.value; });
         particleFolder.addBinding(tweaks, 'particleCountPercent', { min: 0, max: 100, step: 1, label: 'Count %' }).on('change', (event) => {
             particleData.particleCountRatio = clamp(event.value / 100, 0, 1);
@@ -3368,6 +3610,7 @@ async function initControls() {
             particlesUniformData.uColor.value.set(tweaks.particleColor);
             particleData.particleSpeedFactor = tweaks.particleSpeedFactor;
             particleData.waveAmplitude = tweaks.waveAmplitude;
+            particleData.boundaryPush = tweaks.particleBoundaryPush;
             particleData.velocityFactor = tweaks.velocityFactor;
             particleData.particleCountRatio = clamp(tweaks.particleCountPercent / 100, 0, 1);
             particlesUniformData.uCountRatio.value = particleData.particleCountRatio;
@@ -3453,13 +3696,15 @@ function animateMeshRotation(delta) {
     else if (next < -twoPi) next += twoPi * 2;
 
     tweaks.rotationY = next;
-    mesh.rotation.y = particleMesh.rotation.y = next;
+    mesh.rotation.y = innerMesh.rotation.y = particleMesh.rotation.y = next;
 }
 
 
 function floatMeshes(time) {
-    mesh.position.set(0, Math.sin(time * 2.0) * 0.5, 0);
-    particleMesh.position.set(0, Math.sin(time * 2.0) * 0.5, 0);
+    const floatY = Math.sin(time * 2.0) * 0.5;
+    mesh.position.set(0, floatY, 0);
+    innerMesh.position.set(0, floatY, 0);
+    particleMesh.position.set(0, floatY, 0);
 }
 
 
@@ -3519,6 +3764,7 @@ function animate() {
 
     const meshScale = 1 + audio.bass * audioReactive.lowMeshSizeResponse;
     mesh.scale.setScalar(meshScale);
+    innerMesh.scale.setScalar(meshScale * innerShellScale);
     particleMesh.scale.setScalar(meshScale);
 
     const midHighMagnitude = Math.min(1, audio.mids * 0.55 + audio.highs * 0.65);
