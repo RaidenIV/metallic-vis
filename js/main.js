@@ -108,19 +108,8 @@ const re = new THREE.WebGLRenderer({ canvas: cnvs, antialias: true });
 const displayPixelRatio = Math.min(window.devicePixelRatio, 2);
 re.setPixelRatio(displayPixelRatio);
 re.setSize(cnvs.clientWidth * scale, cnvs.clientHeight * scale, false);
-re.toneMapping = THREE.ACESFilmicToneMapping;
-re.toneMappingExposure = 1.1;
+re.toneMapping = THREE.CineonToneMapping;
 re.outputColorSpace = THREE.SRGBColorSpace;
-
-// Subtle studio lights complement the environment map. They create readable
-// specular shape cues without replacing the selected background/reflections.
-const keyLight = new THREE.DirectionalLight(0xffffff, 2.1);
-keyLight.position.set(6, 8, 10);
-scene.add(keyLight);
-
-const rimLight = new THREE.DirectionalLight(0x9fc5ff, 1.25);
-rimLight.position.set(-8, 3, -7);
-scene.add(rimLight);
 
 
 const effectComposer1 = new EffectComposer(re);
@@ -2032,15 +2021,6 @@ phyMat.metalness = 2.0;
 phyMat.roughness = 0.0;
 phyMat.side = THREE.DoubleSide;
 
-const visualSettings = {
-    exposure: 1.1,
-    environmentIntensity: 1.15,
-    roughnessVariation: 0.055,
-    roughnessScale: 0.8,
-    keyLightIntensity: 2.1,
-    rimLightIntensity: 1.25,
-};
-
 // Surface presets. Only appearance properties are touched — colour, side and
 // the dissolve shader injection stay under their existing controls. 'Metallic'
 // reproduces the original material exactly.
@@ -2051,9 +2031,9 @@ const materialDefaults = {
 
 const materialPresets = {
     'Metallic': {
-        metalness: 1.0, roughness: 0.09, transmission: 0.0, thickness: 0.0,
-        ior: 1.5, iridescence: 0.0, clearcoat: 0.18, clearcoatRoughness: 0.08,
-        specularIntensity: 1.0, envMapIntensity: 1.25,
+        metalness: 2.0, roughness: 0.0, transmission: 0.0, thickness: 0.0,
+        ior: 1.5, iridescence: 0.0, clearcoat: 0.0, clearcoatRoughness: 0.0,
+        specularIntensity: 1.0, envMapIntensity: 1.0,
         attenuationDistance: Infinity, attenuationColor: 0xffffff,
     },
     'Chrome': {
@@ -2113,7 +2093,7 @@ function applyMaterialPreset(name) {
     phyMat.clearcoat = preset.clearcoat;
     phyMat.clearcoatRoughness = preset.clearcoatRoughness;
     phyMat.specularIntensity = preset.specularIntensity;
-    phyMat.envMapIntensity = preset.envMapIntensity * visualSettings.environmentIntensity;
+    phyMat.envMapIntensity = preset.envMapIntensity;
     phyMat.attenuationDistance = preset.attenuationDistance;
     phyMat.attenuationColor.set(preset.attenuationColor);
 
@@ -2126,20 +2106,6 @@ function applyMaterialPreset(name) {
 
     if (needsRecompile) phyMat.needsUpdate = true;
     currentMaterialName = name;
-}
-
-function applyVisualSettings() {
-    re.toneMappingExposure = visualSettings.exposure;
-    keyLight.intensity = visualSettings.keyLightIntensity;
-    rimLight.intensity = visualSettings.rimLightIntensity;
-    dissolveUniformData.uRoughnessVariation.value = visualSettings.roughnessVariation;
-    dissolveUniformData.uRoughnessScale.value = visualSettings.roughnessScale;
-
-    const preset = materialPresets[currentMaterialName];
-    if (preset) phyMat.envMapIntensity = preset.envMapIntensity * visualSettings.environmentIntensity;
-    if (typeof innerMat !== 'undefined' && innerMat) {
-        innerMat.envMapIntensity = 0.55 * visualSettings.environmentIntensity;
-    }
 }
 
 
@@ -2179,12 +2145,6 @@ const dissolveUniformData = {
     },
     uEdgeSoftness: {
         value: 1.45
-    },
-    uRoughnessVariation: {
-        value: visualSettings.roughnessVariation
-    },
-    uRoughnessScale: {
-        value: visualSettings.roughnessScale
     }
 }
 
@@ -2223,17 +2183,8 @@ function setupDissolveShader(shader) {
         uniform float uEdgeCoreWidth;
         uniform float uEdgeIntensity;
         uniform float uEdgeSoftness;
-        uniform float uRoughnessVariation;
-        uniform float uRoughnessScale;
 
         ${snoise}
-    `);
-
-    // Small-scale roughness variation gives reflections real surface breakup
-    // without changing the silhouette or adding expensive texture assets.
-    shader.fragmentShader = shader.fragmentShader.replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
-        float surfaceRoughnessNoise = snoise(vPos * uRoughnessScale);
-        roughnessFactor = clamp(roughnessFactor + surfaceRoughnessNoise * uRoughnessVariation, 0.02, 1.0);
     `);
 
     // Apply the dissolve before Three.js tone mapping / output-color conversion.
@@ -2315,7 +2266,7 @@ const innerMat = new THREE.MeshPhysicalMaterial({
     clearcoat: 0.2,
     clearcoatRoughness: 0.22,
     side: THREE.DoubleSide,
-    envMapIntensity: 0.55 * visualSettings.environmentIntensity,
+    envMapIntensity: 0.55,
 });
 
 function setupInnerShellShader(shader) {
@@ -2368,7 +2319,6 @@ let innerMesh = new THREE.Mesh(meshGeo, innerMat);
 innerMesh.scale.setScalar(innerShellScale);
 scene.add(innerMesh);
 
-applyVisualSettings();
 applyMaterialPreset(currentMaterialName);
 
 let particleMesh;
@@ -3053,7 +3003,6 @@ function collectSettings() {
         material: currentMaterialName,
         viewport: { ...viewportSettings },
         camera: { ...cameraSettings },
-        visual: { ...visualSettings },
         audioReactive: { ...audioReactive },
         audioResolution: audioSettings.fftSize,
         loop: { ...loopSettings },
@@ -3111,10 +3060,6 @@ async function applyImportedSettings(data) {
     if (data.loop) Object.assign(loopSettings, data.loop);
     if (data.viewport) Object.assign(viewportSettings, data.viewport);
     if (data.camera) Object.assign(cameraSettings, data.camera);
-    if (data.visual) {
-        Object.assign(visualSettings, data.visual);
-        applyVisualSettings();
-    }
     if (data.dissolve) {
         Object.assign(tweaks, data.dissolve);
         dissolveUniformData.uProgress.value = tweaks.dissolveProgress;
@@ -3399,7 +3344,6 @@ const sectionDefaults = {
     audioMuted: audioInfo.muted,
     viewport: { ...viewportSettings },
     camera: { ...cameraSettings },
-    visual: { ...visualSettings },
     background: currentBackgroundName,
     meshName: geoNames[0],
     materialName: currentMaterialName,
@@ -3643,19 +3587,6 @@ async function initControls() {
         const materialBlade = createTweakList(meshFolder, 'Material', materialNames, materialNames);
         materialBlade.value = currentMaterialName;
         materialBlade.on('change', (event) => applyMaterialPreset(event.value));
-
-        const lightingFolder = meshFolder.addFolder({ title: 'Lighting & Surface', expanded: false });
-        lightingFolder.addBinding(visualSettings, 'exposure', { min: 0.35, max: 2.5, step: 0.01, label: 'Exposure' }).on('change', applyVisualSettings);
-        lightingFolder.addBinding(visualSettings, 'environmentIntensity', { min: 0, max: 3, step: 0.01, label: 'Environment' }).on('change', applyVisualSettings);
-        lightingFolder.addBinding(visualSettings, 'roughnessVariation', { min: 0, max: 0.35, step: 0.001, label: 'Roughness Variation' }).on('change', applyVisualSettings);
-        lightingFolder.addBinding(visualSettings, 'roughnessScale', { min: 0.05, max: 4, step: 0.01, label: 'Roughness Scale' }).on('change', applyVisualSettings);
-        lightingFolder.addBinding(visualSettings, 'keyLightIntensity', { min: 0, max: 8, step: 0.05, label: 'Key Light' }).on('change', applyVisualSettings);
-        lightingFolder.addBinding(visualSettings, 'rimLightIntensity', { min: 0, max: 8, step: 0.05, label: 'Rim Light' }).on('change', applyVisualSettings);
-        addResetButton(lightingFolder, () => {
-            Object.assign(visualSettings, sectionDefaults.visual);
-            applyVisualSettings();
-        });
-
         meshFolder.addBinding(tweaks, 'bloomStrength', { min: 0, max: 5, step: 0.01, label: 'Bloom Strength' }).on('change', (event) => {
             unrealBloomPass.strength = event.value;
         });
