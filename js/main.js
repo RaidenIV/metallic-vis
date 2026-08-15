@@ -9,7 +9,7 @@ import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { TAARenderPass } from 'three/addons/postprocessing/TAARenderPass.js';
-import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-hdr-taa-2';
+import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-hdr-fix-1';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -197,9 +197,24 @@ const loadProgressUi = {
     },
 };
 
+// Marks a load as started and re-arms the panel. Progress updates arriving
+// after completion are ignored: RGBELoader is built on FileLoader, which calls
+// LoadingManager.itemEnd() from a .finally() handler, so the manager's final
+// onProgress lands *after* the await in loadBackground has already run
+// completeLoadProgress. That late update cleared the pending hide timer and
+// left the panel stranded at 100%. ImageLoader (cube and jpg backgrounds) calls
+// itemEnd synchronously before the continuation, which is why only the HDR
+// panoramas showed it.
+function beginLoadProgress(kind, label) {
+    const ui = loadProgressUi[kind];
+    if (ui) ui.settled = false;
+    updateLoadProgress(kind, 0, label);
+}
+
 function updateLoadProgress(kind, progress, label) {
     const ui = loadProgressUi[kind];
     if (!ui?.panel || !ui.label || !ui.percent || !ui.fill) return;
+    if (ui.settled) return;
 
     if (ui.hideTimer) {
         clearTimeout(ui.hideTimer);
@@ -218,6 +233,7 @@ function completeLoadProgress(kind, label) {
     const ui = loadProgressUi[kind];
     updateLoadProgress(kind, 1, label);
     if (!ui?.panel) return;
+    ui.settled = true;
     ui.hideTimer = setTimeout(() => {
         ui.panel.hidden = true;
         ui.hideTimer = null;
@@ -227,6 +243,7 @@ function completeLoadProgress(kind, label) {
 function failLoadProgress(kind, label) {
     const ui = loadProgressUi[kind];
     if (!ui?.panel || !ui.label || !ui.percent) return;
+    ui.settled = true;
     if (ui.hideTimer) clearTimeout(ui.hideTimer);
     ui.panel.hidden = false;
     ui.label.textContent = label;
@@ -636,7 +653,7 @@ async function loadAudioFile(file) {
     refreshAudioInfo();
 
     const progressLabel = `Audio · ${file.name}`;
-    updateLoadProgress('audio', 0, progressLabel);
+    beginLoadProgress('audio', progressLabel);
     audioInfo.name = file.name;
     audioInfo.type = file.type || 'Unknown';
     audioInfo.size = formatBytes(file.size);
@@ -1893,6 +1910,21 @@ function createEnvironmentSource(image) {
 // backdrop, and PMREM'd separately for reflections.
 const MAX_CACHED_ENVIRONMENTS = 3;
 
+// A 1024-per-face half-float cube target is roughly 50 MB, so only the visible
+// one is kept. PMREM targets are a fraction of that and stay cached.
+function releaseUnusedCubeTargets(keepName) {
+    backgroundEnvironmentCache.forEach((entry, key) => {
+        if (key === keepName || !entry?.cubeTarget) return;
+        try {
+            entry.cubeTarget.dispose();
+        } catch (error) {
+            console.warn('Backdrop cube target could not be disposed.', error);
+        }
+        entry.cubeTarget = null;
+        entry.backgroundTexture = null;
+    });
+}
+
 function trimEnvironmentCache() {
     while (backgroundEnvironmentCache.size > MAX_CACHED_ENVIRONMENTS) {
         const oldestKey = backgroundEnvironmentCache.keys().next().value;
@@ -1914,6 +1946,13 @@ function getBackgroundEnvironment(name, texture) {
         // Re-insert so the most recently used entry is last in the map.
         backgroundEnvironmentCache.delete(name);
         backgroundEnvironmentCache.set(name, cached);
+        if (!cached.cubeTarget && texture.mapping === THREE.EquirectangularReflectionMapping) {
+            const faceSize = clamp(Math.round((texture.image?.width || 2048) / 2), 512, 2048);
+            cached.cubeTarget = new THREE.WebGLCubeRenderTarget(faceSize);
+            cached.cubeTarget.fromEquirectangularTexture(re, texture);
+            cached.backgroundTexture = cached.cubeTarget.texture;
+        }
+        releaseUnusedCubeTargets(name);
         return cached;
     }
 
@@ -1933,18 +1972,21 @@ function getBackgroundEnvironment(name, texture) {
     try {
         const pmrem = pmremGenerator.fromEquirectangular(source);
 
-        // Backdrop resolution is independent of the reflection map: half the
-        // panorama width per cube face keeps the visible backdrop as sharp as
-        // the source allows without a PMREM-sized blur.
+        // Backdrop resolution is independent of the reflection map. A cube face
+        // spans 90 degrees, so at a ~60 degree camera the visible slice is only
+        // two thirds of a face: at 512 that was ~340 px stretched over a 1440 px
+        // viewport, which is what read as low resolution. 1024 per face halves
+        // the upscale and is what a 2048-wide panorama can actually supply.
         let cubeTarget = null;
         if (texture.mapping === THREE.EquirectangularReflectionMapping) {
-            const faceSize = clamp(Math.round((image.width || 1024) / 2), 256, 1024);
+            const faceSize = clamp(Math.round((image.width || 2048) / 2), 512, 2048);
             cubeTarget = new THREE.WebGLCubeRenderTarget(faceSize);
             cubeTarget.fromEquirectangularTexture(re, texture);
         }
 
         entry = { pmrem, cubeTarget, environmentTexture: pmrem.texture, backgroundTexture: cubeTarget?.texture || null };
         backgroundEnvironmentCache.set(name, entry);
+        releaseUnusedCubeTargets(name);
         trimEnvironmentCache();
         return entry;
     } finally {
@@ -1963,7 +2005,7 @@ async function loadBackground(name) {
 
     try {
         if (!texture) {
-            updateLoadProgress('background', 0, progressLabel);
+            beginLoadProgress('background', progressLabel);
 
             const manager = new THREE.LoadingManager();
             manager.onProgress = (_url, itemsLoaded, itemsTotal) => {
