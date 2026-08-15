@@ -7,6 +7,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { TeapotGeometry } from 'three/addons/geometries/TeapotGeometry.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { analyzeAudioRange, sampleBandsAtTime } from './analysis.js?v=20260815-offline-export-1';
 
 const snoise = String.raw`vec4 permute(vec4 x) {
     return mod(((x * 34.0) + 1.0) * x, 289.0);
@@ -2926,27 +2927,14 @@ const exportSettings = {
     resolution: '1080',
     frameRate: '60',
     bitrateMbps: '16',
-    videoType: 'Auto',
+    videoType: 'MP4',
     status: 'Idle',
 };
 let exportOverrideSize = null;
-let mediaRecorder = null;
-let recordedChunks = [];
-let exportStopAt = null;
-let exportStartAt = 0;
-let exportPreviousLoop = false;
-// Frame pacing state. While these are active the render loop runs on an even
-// 1/fps grid instead of whatever cadence requestAnimationFrame happens to give.
-let exportFrameInterval = 0;
-let exportVideoTrack = null;
-// Frame grid anchored to the audio clock. Frames are addressed by index from a
-// fixed origin so a slow frame can never re-phase the schedule.
-let exportFrameOrigin = 0;
-let exportFrameIndex = 0;
-let exportFramesRendered = 0;
-let exportBeganAt = 0;
-let previousExportTransportTime = null;
-const EXPORT_FRAME_TOLERANCE_MS = 1.5;
+// Offline export state. There is no realtime recorder any more: the exporter
+// owns the render loop for the duration of the job.
+let offlineExportActive = false;
+let offlineExportCancelled = false;
 
 function getExportDimensions() {
     const shortSideMap = { '1080': 1080, '2K': 1440, '4K': 2160 };
@@ -3139,28 +3127,172 @@ importJsonInput.addEventListener('change', async () => {
     }
 });
 
-function chooseRecordingMimeType() {
-    const requested = exportSettings.videoType;
-    const candidates = requested === 'MP4'
-        ? ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4']
-        : requested === 'WebM'
-            ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
-            : ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-    return candidates.find((type) => MediaRecorder.isTypeSupported(type)) || '';
+// --- Offline video export ---------------------------------------------------
+// Frames are rendered off a fixed frame clock, not the wall clock. Frame N is
+// defined to be the visualizer evaluated at exportStart + N / frameRate, is
+// handed to WebCodecs with that exact timestamp, and the audio for the same
+// range is encoded straight from the decoded buffer. Both tracks are authored
+// onto one timeline, so synchronization is exact by construction and does not
+// depend on how fast the machine renders.
+//
+// The previous implementation captured the canvas in real time with
+// MediaRecorder. Nothing in that pipeline recorded the intended correspondence
+// between an audio position and a video frame: the mapping was whatever the
+// machine happened to achieve, which is why it drifted.
+
+let Mp4MuxerModule = null;
+
+async function loadMp4MuxerModule() {
+    if (!Mp4MuxerModule) {
+        Mp4MuxerModule = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5/+esm');
+    }
+    return Mp4MuxerModule;
+}
+
+function nextEventLoopTurn() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function stopVideoExport() {
-    if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
+    if (offlineExportActive) offlineExportCancelled = true;
+}
+
+function hasWebCodecsSupport() {
+    return Boolean(window.VideoEncoder && window.VideoFrame && window.AudioEncoder && window.AudioData);
+}
+
+async function waitForEncoderQueue(encoder, maximumQueueSize = 1) {
+    while (encoder.encodeQueueSize > maximumQueueSize) {
+        if (offlineExportCancelled) return;
+        await nextEventLoopTurn();
+    }
+}
+
+function getEffectiveVideoBitrate(baseBitrateMbps, width, height) {
+    // Treat the selected value as the 1080p target, then scale gently for larger
+    // rasters. Square-root scaling avoids a 4x bitrate spike at 4K.
+    const basePixels = 1920 * 1080;
+    const pixelScale = Math.max(1, (width * height) / basePixels);
+    const resolutionScale = clamp(Math.sqrt(pixelScale), 1, 2.5);
+    return Math.round(clamp(baseBitrateMbps * resolutionScale, 1, 120) * 1_000_000);
+}
+
+async function chooseSupportedAvcConfig(width, height, bitrate, frameRate) {
+    const candidates = ['avc1.640033', 'avc1.64002A', 'avc1.4D402A', 'avc1.42001F'];
+    // Offline export must never use realtime mode: a realtime encoder is allowed
+    // to drop frames when it cannot keep pace, which is exactly the failure this
+    // rewrite exists to remove.
+    const qualityProfiles = [
+        { latencyMode: 'quality', bitrateMode: 'variable', hardwareAcceleration: 'no-preference' },
+        { latencyMode: 'quality', hardwareAcceleration: 'no-preference' },
+        { bitrateMode: 'variable', hardwareAcceleration: 'no-preference' },
+    ];
+
+    for (const codec of candidates) {
+        for (const qualityProfile of qualityProfiles) {
+            const config = { codec, width, height, bitrate, framerate: frameRate, ...qualityProfile, avc: { format: 'avc' } };
+            try {
+                const support = await VideoEncoder.isConfigSupported(config);
+                if (support.supported) return support.config || config;
+            } catch (error) {
+                console.warn(`Unsupported AVC configuration ${codec}`, error);
+            }
+        }
+    }
+    throw new Error('The selected resolution, bitrate or frame rate is not supported by this browser.');
+}
+
+function getVideoFrameTiming(frameIndex, frameRate) {
+    const timestampUs = Math.round((frameIndex * 1_000_000) / frameRate);
+    const nextTimestampUs = Math.round(((frameIndex + 1) * 1_000_000) / frameRate);
+    return { timestampUs, durationUs: Math.max(1, nextTimestampUs - timestampUs) };
+}
+
+function getVideoExportRange() {
+    const duration = getTransportDuration();
+    if (duration <= 0) return { start: 0, end: 0, duration: 0 };
+    const useLoopRange = loopSettings.enabled && loopSettings.end > loopSettings.start;
+    const start = useLoopRange ? Math.max(0, loopSettings.start) : 0;
+    const end = useLoopRange ? Math.min(duration, loopSettings.end) : duration;
+    return { start, end, duration: Math.max(0, end - start) };
+}
+
+async function encodeAudioIntoMuxer(muxer, audioBuffer, startSeconds, endSeconds) {
+    const sampleRate = audioBuffer.sampleRate;
+    const numberOfChannels = 2;
+    const audioConfig = { codec: 'mp4a.40.2', sampleRate, numberOfChannels, bitrate: 192_000 };
+
+    let support;
+    try {
+        support = await AudioEncoder.isConfigSupported(audioConfig);
+    } catch (error) {
+        return { encoded: false, reason: error.message };
+    }
+    if (!support.supported) return { encoded: false, reason: 'AAC encoding is unsupported.' };
+
+    let encodingError = null;
+    const encoder = new AudioEncoder({
+        output: (chunk, metadata) => muxer.addAudioChunk(chunk, metadata),
+        error: (error) => { encodingError = error; },
+    });
+    encoder.configure(support.config || audioConfig);
+
+    const sourceLeft = audioBuffer.getChannelData(0);
+    const sourceRight = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : sourceLeft;
+    const gain = audioInfo.muted ? 0 : clamp(audioInfo.volume / 100, 0, 1);
+    const chunkSize = 2048;
+    const startFrame = clamp(Math.floor(startSeconds * sampleRate), 0, audioBuffer.length);
+    const endFrame = clamp(Math.ceil(endSeconds * sampleRate), startFrame, audioBuffer.length);
+    const totalFrames = endFrame - startFrame;
+
+    try {
+        for (let offset = 0; offset < totalFrames; offset += chunkSize) {
+            if (offlineExportCancelled) break;
+            if (encodingError) throw encodingError;
+
+            const frameCount = Math.min(chunkSize, totalFrames - offset);
+            const planarData = new Float32Array(frameCount * numberOfChannels);
+            for (let index = 0; index < frameCount; index += 1) {
+                const sourceIndex = startFrame + offset + index;
+                planarData[index] = sourceLeft[sourceIndex] * gain;
+                planarData[frameCount + index] = sourceRight[sourceIndex] * gain;
+            }
+
+            const audioData = new AudioData({
+                format: 'f32-planar',
+                sampleRate,
+                numberOfFrames: frameCount,
+                numberOfChannels,
+                // Timestamps run from zero across the exported range, matching
+                // the video track's frame-index timeline exactly.
+                timestamp: Math.round((offset / sampleRate) * 1_000_000),
+                data: planarData,
+            });
+
+            encoder.encode(audioData);
+            audioData.close();
+            await waitForEncoderQueue(encoder, 8);
+            await nextEventLoopTurn();
+        }
+
+        if (!offlineExportCancelled) await encoder.flush();
+    } finally {
+        try {
+            if (encoder.state !== 'closed') encoder.close();
+        } catch (error) {
+            console.warn('Audio encoder cleanup failed', error);
+        }
+    }
+
+    if (encodingError) return { encoded: false, reason: encodingError.message };
+    return { encoded: true };
 }
 
 
 // --- Export progress modal -------------------------------------------------
-// The canvas has to keep rendering for the whole export: the video track is a
-// live capture of it, so pausing the visualization would record a frozen frame.
-// What the modal does instead is cover it completely with an opaque panel and
-// block interaction, and while it is up the render loop skips every Tweakpane
-// DOM refresh, which is the only per-frame work that is genuinely wasted when
-// the panel is hidden.
+// Offline export does not need the canvas to be visible, so the modal simply
+// covers it and blocks interaction while frames are rendered as fast as the
+// machine allows.
 const exportModalRefs = {};
 
 function getExportModalRefs() {
@@ -3176,20 +3308,18 @@ function getExportModalRefs() {
     exportModalRefs.cancel = document.getElementById('export-modal-cancel');
     if (exportModalRefs.cancel) {
         exportModalRefs.cancel.addEventListener('click', () => {
-            if (exportModalRefs.status) exportModalRefs.status.textContent = 'Finishing current segment…';
-            pauseTransport();
+            if (exportModalRefs.status) exportModalRefs.status.textContent = 'Cancelling…';
             stopVideoExport();
         });
     }
     return exportModalRefs;
 }
 
-function showExportModal(frameRate) {
+function showExportModal(frameRate, width, height) {
     const refs = getExportModalRefs();
     if (!refs.root) return;
-    const size = exportOverrideSize || getExportDimensions();
-    if (refs.format) refs.format.textContent = `${size.width}x${size.height} · ${frameRate} fps`;
-    if (refs.status) refs.status.textContent = 'Capturing frames…';
+    if (refs.format) refs.format.textContent = `${width}x${height} · ${frameRate} fps`;
+    if (refs.status) refs.status.textContent = 'Preparing…';
     if (refs.fill) refs.fill.style.width = '0%';
     if (refs.percent) refs.percent.textContent = '0%';
     if (refs.frames) refs.frames.textContent = '0 frames';
@@ -3204,169 +3334,206 @@ function hideExportModal() {
     document.body.classList.remove('exporting');
 }
 
-function updateExportModal() {
+function updateExportModal({ ratio, stage, completedFrames, totalFrames, currentTime, duration, startedAt }) {
     const refs = getExportModalRefs();
     if (!refs.root || refs.root.hidden) return;
 
-    const span = Math.max(0, (exportStopAt ?? 0) - exportStartAt);
-    const elapsed = Math.max(0, getTransportTime() - exportStartAt);
-    const ratio = span > 0 ? clamp(elapsed / span, 0, 1) : 0;
-
-    if (refs.fill) refs.fill.style.width = `${(ratio * 100).toFixed(1)}%`;
-    if (refs.percent) refs.percent.textContent = `${Math.round(ratio * 100)}%`;
-    if (refs.time) refs.time.textContent = `${formatTime(elapsed)} / ${formatTime(span)}`;
-    // Show rendered frames against the number the audio timeline calls for. The
-    // video track is captured on its own clock either way, so a shortfall means
-    // repeated frames rather than desync — but it tells the user the machine is
-    // not keeping up with the requested rate.
-    const expectedFrames = exportFrameInterval > 0
-        ? Math.max(0, Math.floor((elapsed * 1000) / exportFrameInterval))
-        : 0;
-    if (refs.frames) {
-        refs.frames.textContent = expectedFrames > 0
-            ? `${exportFramesRendered.toLocaleString()} / ${expectedFrames.toLocaleString()} frames`
-            : `${exportFramesRendered.toLocaleString()} frames`;
+    const normalized = clamp(ratio, 0, 1);
+    if (refs.fill) refs.fill.style.width = `${(normalized * 100).toFixed(1)}%`;
+    if (refs.percent) refs.percent.textContent = `${Math.round(normalized * 100)}%`;
+    if (refs.status) refs.status.textContent = stage;
+    if (refs.time && Number.isFinite(currentTime) && Number.isFinite(duration)) {
+        refs.time.textContent = `${formatTime(currentTime)} / ${formatTime(duration)}`;
     }
-    if (refs.fps) {
-        const wall = (performance.now() - exportBeganAt) / 1000;
-        const renderRate = wall > 0.5 ? exportFramesRendered / wall : 0;
-        refs.fps.textContent = renderRate > 0 ? `${renderRate.toFixed(1)} fps rendered` : '—';
+    if (refs.frames && Number.isFinite(totalFrames)) {
+        refs.frames.textContent = `${completedFrames.toLocaleString()} / ${totalFrames.toLocaleString()} frames`;
+    }
+    if (refs.fps && Number.isFinite(startedAt) && completedFrames >= 5 && totalFrames > completedFrames) {
+        const elapsedWall = Math.max(0.001, (performance.now() - startedAt) / 1000);
+        const remaining = (totalFrames - completedFrames) * (elapsedWall / completedFrames);
+        refs.fps.textContent = `${formatTime(remaining)} remaining`;
     }
 }
 
+
 async function startVideoExport() {
-    if (mediaRecorder?.state === 'recording') {
+    if (offlineExportActive) {
         stopVideoExport();
         return;
     }
     if (!decodedAudioBuffer) {
-        exportSettings.status = 'Load audio before video export';
+        exportSettings.status = 'Load audio first';
         refreshPane();
         return;
     }
-    if (!window.MediaRecorder || !cnvs.captureStream) {
-        exportSettings.status = 'Video export unsupported';
+    if (!hasWebCodecsSupport()) {
+        exportSettings.status = 'Video export needs WebCodecs (Chrome or Edge)';
         refreshPane();
         return;
     }
 
-    // Export must begin from a stopped transport. If the user exports while
-    // playback is already running, seekTransport() would otherwise restart the
-    // source before MediaRecorder exists and then start it a second time below,
-    // producing an audio/video start offset. Resume the AudioContext first, then
-    // arm both tracks from one shared audio-clock origin.
-    pauseTransport();
-    ensureAudioAnalyser();
-    if (audioContext.state === 'suspended') await audioContext.resume();
-    exportOverrideSize = getExportDimensions();
-    resizeRendererToDisplaySize();
+    const range = getVideoExportRange();
+    if (range.duration <= 0) {
+        exportSettings.status = 'Nothing to export';
+        refreshPane();
+        return;
+    }
 
     const frameRate = Number(exportSettings.frameRate) || 60;
+    const { width, height } = getExportDimensions();
+    const videoBitrate = getEffectiveVideoBitrate(Number(exportSettings.bitrateMbps) || 16, width, height);
+    const totalFrames = Math.max(1, Math.ceil(range.duration * frameRate));
+    const frameDelta = 1 / frameRate;
+    const startedAt = performance.now();
 
-    // Browser-timed capture. The track must own the video timeline: it runs on
-    // the same real-time clock as the recorded audio, so the two stay locked
-    // together no matter how fast the renderer manages to go.
-    //
-    // Driving it manually with captureStream(0) + requestFrame() tied the frame
-    // count to the render count instead. Whenever a frame slot was missed the
-    // video track received one frame fewer than the elapsed time called for,
-    // and since nothing ever made those frames up the video ran progressively
-    // ahead of the audio — the desync being reported here.
-    const canvasStream = cnvs.captureStream(frameRate);
-    const videoTrack = canvasStream.getVideoTracks()[0];
-    if (videoTrack && 'contentHint' in videoTrack) videoTrack.contentHint = 'motion';
-    exportVideoTrack = videoTrack || null;
-    const tracks = videoTrack ? [videoTrack] : [];
-    if (recordingDestination?.stream?.getAudioTracks().length) {
-        tracks.push(...recordingDestination.stream.getAudioTracks());
-    }
-    const stream = new MediaStream(tracks);
-    const mimeType = chooseRecordingMimeType();
-    const options = {
-        videoBitsPerSecond: Math.max(1, Number(exportSettings.bitrateMbps) || 16) * 1_000_000,
-    };
-    if (mimeType) options.mimeType = mimeType;
+    const savedAspect = cam.aspect;
+    const savedTransportOffset = transportOffset;
 
-    recordedChunks = [];
-    mediaRecorder = new MediaRecorder(stream, options);
-    mediaRecorder.addEventListener('dataavailable', (event) => {
-        if (event.data?.size) recordedChunks.push(event.data);
-    });
-    mediaRecorder.addEventListener('stop', () => {
-        const type = mediaRecorder.mimeType || mimeType || 'video/webm';
-        const extension = type.includes('mp4') ? 'mp4' : 'webm';
-        if (recordedChunks.length) downloadBlob(new Blob(recordedChunks, { type }), safeFileName(extension));
+    offlineExportActive = true;
+    offlineExportCancelled = false;
+    pauseTransport();
+    showExportModal(frameRate, width, height);
+
+    let videoEncoder = null;
+    try {
+        exportSettings.status = 'Analysing audio…';
+        updateExportModal({ ratio: 0, stage: 'Analysing audio', completedFrames: 0, totalFrames, currentTime: 0, duration: range.duration, startedAt });
+
+        // Re-analysed on every export so the current band edges, FFT size and
+        // smoothing are the ones baked into the timeline.
+        const analysis = await analyzeAudioRange(decodedAudioBuffer, {
+            fftSize: audioSettings.fftSize,
+            smoothing: audioReactive.smoothing,
+            fps: frameRate,
+            startSeconds: range.start,
+            endSeconds: range.end,
+            bands: [
+                { min: audioReactive.bassMinHz, max: audioReactive.bassMaxHz },
+                { min: audioReactive.midsMinHz, max: audioReactive.midsMaxHz },
+                { min: audioReactive.highsMinHz, max: audioReactive.highsMaxHz },
+            ],
+        }, (progress) => {
+            updateExportModal({ ratio: progress * 0.12, stage: 'Analysing audio', completedFrames: 0, totalFrames, currentTime: 0, duration: range.duration, startedAt });
+        });
+        if (offlineExportCancelled) throw new DOMException('Cancelled', 'AbortError');
+
+        const { Muxer, ArrayBufferTarget } = await loadMp4MuxerModule();
+        const videoConfig = await chooseSupportedAvcConfig(width, height, videoBitrate, frameRate);
+        if (offlineExportCancelled) throw new DOMException('Cancelled', 'AbortError');
+
+        exportOverrideSize = { width, height };
+        resizeRendererToDisplaySize();
+        cam.aspect = width / height;
+        cam.updateProjectionMatrix();
+
+        const target = new ArrayBufferTarget();
+        const muxer = new Muxer({
+            target,
+            video: { codec: 'avc', width, height },
+            audio: { codec: 'aac', sampleRate: decodedAudioBuffer.sampleRate, numberOfChannels: 2 },
+            fastStart: 'in-memory',
+        });
+
+        let encoderError = null;
+        let encodedVideoFrameCount = 0;
+        videoEncoder = new VideoEncoder({
+            output: (chunk, metadata) => {
+                encodedVideoFrameCount += 1;
+                muxer.addVideoChunk(chunk, metadata);
+            },
+            error: (error) => { encoderError = error; },
+        });
+        videoEncoder.configure(videoConfig);
+
+        exportSettings.status = 'Rendering frames…';
+        for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
+            if (offlineExportCancelled) throw new DOMException('Cancelled', 'AbortError');
+            if (encoderError) throw encoderError;
+
+            // The frame index is the clock.
+            const exportTime = Math.min(range.end, range.start + frameIndex / frameRate);
+            renderVisualizationFrame(exportTime, frameDelta, levelsFromAnalysis(analysis, exportTime));
+
+            const timing = getVideoFrameTiming(frameIndex, frameRate);
+            const frame = new VideoFrame(cnvs, { timestamp: timing.timestampUs, duration: timing.durationUs });
+            videoEncoder.encode(frame, { keyFrame: frameIndex % Math.max(1, frameRate * 2) === 0 });
+            frame.close();
+
+            // Never flood the encoder: a deep queue produces uneven output and
+            // large memory spikes at 4K.
+            await waitForEncoderQueue(videoEncoder, 1);
+            await nextEventLoopTurn();
+
+            if (frameIndex % Math.max(1, Math.round(frameRate / 4)) === 0) {
+                updateExportModal({
+                    ratio: 0.12 + ((frameIndex + 1) / totalFrames) * 0.76,
+                    stage: `Rendering frame ${frameIndex + 1} of ${totalFrames}`,
+                    completedFrames: frameIndex + 1,
+                    totalFrames,
+                    currentTime: (frameIndex + 1) / frameRate,
+                    duration: range.duration,
+                    startedAt,
+                });
+            }
+        }
+
+        await videoEncoder.flush();
+        if (encoderError) throw encoderError;
+        if (encodedVideoFrameCount !== totalFrames) {
+            throw new Error(`Encoder returned ${encodedVideoFrameCount} of ${totalFrames} frames. Try a lower resolution.`);
+        }
+
+        exportSettings.status = 'Encoding audio…';
+        updateExportModal({ ratio: 0.9, stage: 'Encoding audio', completedFrames: totalFrames, totalFrames, currentTime: range.duration, duration: range.duration, startedAt });
+        const audioResult = await encodeAudioIntoMuxer(muxer, decodedAudioBuffer, range.start, range.end);
+        if (offlineExportCancelled) throw new DOMException('Cancelled', 'AbortError');
+
+        updateExportModal({ ratio: 0.98, stage: 'Finalizing MP4', completedFrames: totalFrames, totalFrames, currentTime: range.duration, duration: range.duration, startedAt });
+        muxer.finalize();
+
+        const blob = new Blob([target.buffer], { type: 'video/mp4' });
+        downloadBlob(blob, safeFileName('mp4'));
+        exportSettings.status = audioResult.encoded
+            ? `Exported ${(blob.size / 1048576).toFixed(1)} MB`
+            : `Exported without audio (${audioResult.reason})`;
+        updateExportModal({ ratio: 1, stage: 'Complete', completedFrames: totalFrames, totalFrames, currentTime: range.duration, duration: range.duration, startedAt });
+    } catch (error) {
+        if (offlineExportCancelled) {
+            exportSettings.status = 'Export cancelled';
+        } else {
+            console.error('Video export failed', error);
+            exportSettings.status = `Export error: ${error?.message || error}`;
+        }
+    } finally {
+        try {
+            if (videoEncoder && videoEncoder.state !== 'closed') videoEncoder.close();
+        } catch (error) {
+            console.warn('Video encoder cleanup failed', error);
+        }
         exportOverrideSize = null;
         resizeRendererToDisplaySize();
-        exportSettings.status = 'Video exported';
-        mediaRecorder = null;
-        exportStopAt = null;
-        endExportFramePacing();
+        cam.aspect = savedAspect;
+        cam.updateProjectionMatrix();
+        transportOffset = savedTransportOffset;
+        offlineExportActive = false;
+        offlineExportCancelled = false;
         hideExportModal();
-        loopSettings.enabled = exportPreviousLoop;
-        updateAudioLoopMode();
+        refreshAudioInfo();
         refreshPane();
-    });
-
-    const duration = getTransportDuration();
-    const useLoopRange = loopSettings.enabled && duration > 0;
-    const start = useLoopRange ? Math.max(0, loopSettings.start) : 0;
-    const end = useLoopRange ? Math.min(duration, loopSettings.end || duration) : duration;
-    exportPreviousLoop = loopSettings.enabled;
-    loopSettings.enabled = false;
-    updateAudioLoopMode();
-    // seekTransport() is intentionally called while paused so it cannot create
-    // an early AudioBufferSourceNode. MediaRecorder is started first, and the
-    // source is then scheduled a few milliseconds ahead on the AudioContext
-    // clock. The video pacer uses that exact same clock origin, preventing the
-    // first rendered reactive frame from drifting ahead of or behind the audio.
-    seekTransport(start);
-    exportStopAt = end;
-    exportStartAt = start;
-    exportSettings.status = 'Exporting video…';
-    showExportModal(frameRate);
-    mediaRecorder.start(500);
-
-    const synchronizedStart = audioContext.currentTime;
-    const started = startTransportAt(start, synchronizedStart);
-    if (!started) {
-        stopVideoExport();
-        throw new Error('Could not start synchronized export audio.');
     }
-    audioInfo.status = 'Playing';
-    beginExportFramePacing(frameRate, synchronizedStart);
-    refreshPane();
 }
 
 
-function beginExportFramePacing(frameRate, synchronizedContextTime = null) {
-    exportFrameInterval = frameRate > 0 ? 1000 / frameRate : 0;
-    // Use the Web Audio clock during export. The audio source, FFT analyser and
-    // render cadence share one monotonic timeline instead of mixing
-    // AudioContext.currentTime with performance.now().
-    exportFrameOrigin = audioContext && Number.isFinite(synchronizedContextTime)
-        ? synchronizedContextTime * 1000
-        : (audioContext ? audioContext.currentTime * 1000 : performance.now());
-    exportFrameIndex = 0;
-    exportFramesRendered = 0;
-    exportBeganAt = performance.now();
-    previousExportTransportTime = exportStartAt;
-}
-
-
-function endExportFramePacing() {
-    exportFrameInterval = 0;
-    if (exportVideoTrack) {
-        try {
-            exportVideoTrack.stop();
-        } catch (error) {
-            console.warn('Capture track could not be stopped.', error);
-        }
-    }
-    exportVideoTrack = null;
-    exportFrameOrigin = 0;
-    exportFrameIndex = 0;
-    previousExportTransportTime = null;
+// Convert an analysed frame into the same shape readAudioLevels() returns, so
+// the sensitivity control and the level weighting stay live.
+function levelsFromAnalysis(analysis, seconds) {
+    const raw = sampleBandsAtTime(analysis, seconds);
+    if (!raw) return { bass: 0, mids: 0, highs: 0, level: 0 };
+    const sensitivity = audioReactive.sensitivity;
+    const bass = Math.min(1, raw[0] * sensitivity);
+    const mids = Math.min(1, raw[1] * sensitivity);
+    const highs = Math.min(1, raw[2] * sensitivity);
+    return { bass, mids, highs, level: Math.min(1, (bass * 0.5) + (mids * 0.3) + (highs * 0.2)) };
 }
 
 
@@ -3726,7 +3893,8 @@ async function initControls() {
         const exportBitrateBlade = createTweakList(exportFolder, 'Bitrate', ['6 Mbps', '10 Mbps', '16 Mbps', '24 Mbps'], ['6', '10', '16', '24']);
         exportBitrateBlade.value = exportSettings.bitrateMbps;
         exportBitrateBlade.on('change', (event) => exportSettings.bitrateMbps = event.value);
-        const exportTypeBlade = createTweakList(exportFolder, 'Video Type', ['Auto', 'MP4', 'WebM'], ['Auto', 'MP4', 'WebM']);
+        const exportTypeBlade = createTweakList(exportFolder, 'Video Type', ['MP4'], ['MP4']);
+        exportSettings.videoType = 'MP4';
         exportTypeBlade.value = exportSettings.videoType;
         exportTypeBlade.on('change', (event) => exportSettings.videoType = event.value);
         exportFolder.addButton({ title: 'Export Video' }).on('click', () => { void startVideoExport(); });
@@ -3739,6 +3907,9 @@ async function initControls() {
             exportResolutionBlade.value = exportSettings.resolution;
             exportFpsBlade.value = exportSettings.frameRate;
             exportBitrateBlade.value = exportSettings.bitrateMbps;
+            // Legacy settings JSON may carry 'Auto' or 'WebM'; the offline
+            // pipeline only muxes MP4, so normalise before touching the blade.
+            exportSettings.videoType = 'MP4';
             exportTypeBlade.value = exportSettings.videoType;
         });
     } catch (error) {
@@ -3814,51 +3985,13 @@ const clock = new THREE.Clock();
 let dissolveMotionPhase = 0;
 let previousAnimationTime = performance.now();
 let lastTransportUiUpdate = 0;
-function animate() {
-    const animationNow = performance.now();
-
-    // Export frame pacing. Camera presets are parametric on wall-clock time, so
-    // the paths themselves are smooth; what read as a dropped frame rate was the
-    // encoder receiving frames at whatever irregular interval the display
-    // happened to deliver. Rendering only when the next 1/fps slot is due gives
-    // the encoder evenly spaced scene time, which is what rotation needs.
-    if (exportFrameInterval > 0) {
-        const exportClockNow = audioContext ? audioContext.currentTime * 1000 : animationNow;
-        // Frame slots are addressed by index from a fixed origin rather than by
-        // repeatedly advancing a "next frame" stamp. The previous form clamped
-        // that stamp forward to the current time after every late frame, which
-        // silently re-phased the render grid against the audio clock and let the
-        // two drift apart over a long export. Deriving the slot from the origin
-        // means a slow frame skips whole slots and the grid stays anchored.
-        const dueIndex = Math.floor((exportClockNow - exportFrameOrigin + EXPORT_FRAME_TOLERANCE_MS) / exportFrameInterval);
-        if (dueIndex < exportFrameIndex) {
-            requestAnimationFrame(animate);
-            return;
-        }
-        exportFrameIndex = dueIndex + 1;
-    }
-
-    const transportTime = exportFrameInterval > 0 ? getTransportTime() : null;
-    let time = exportFrameInterval > 0 ? transportTime : clock.getElapsedTime();
-    let animationDelta;
-    if (exportFrameInterval > 0) {
-        const previous = Number.isFinite(previousExportTransportTime)
-            ? previousExportTransportTime
-            : transportTime;
-        // Clamped generously rather than at the 0.1 s used for live playback.
-        // During export the transport is the authority on elapsed time, and
-        // capping delta at 0.1 s made every frame slower than 10 fps advance the
-        // visuals less than the audio moved, so rotation and dissolve motion
-        // fell permanently behind the track.
-        animationDelta = Math.min(1, Math.max(0, transportTime - previous));
-        previousExportTransportTime = transportTime;
-    } else {
-        animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
-        previousAnimationTime = animationNow;
-    }
-
-    animateDissolve(animationDelta);
-    animateMeshRotation(animationDelta);
+// One frame of the visualization, expressed purely as a function of (time,
+// delta, audio levels). Both the realtime preview and the deterministic export
+// loop call this, which is what makes an exported frame identical to the same
+// moment on screen.
+function renderVisualizationFrame(time, delta, audio) {
+    animateDissolve(delta);
+    animateMeshRotation(delta);
 
     // Apply the requested frequency mapping without changing the underlying
     // control values: lows scale the mesh, while mids/highs drive bloom and
@@ -3866,14 +3999,13 @@ function animate() {
     const baseParticleSize = particlesUniformData.uBaseSize.value;
     const baseParticleSpeed = particleData.particleSpeedFactor;
     const baseBloomStrength = Math.max(0, Number(tweaks.bloomStrength) || 0);
-    const audio = readAudioLevels();
 
     // Move the existing dissolve field dynamically through 3D object space
     // without changing the dissolve threshold. Overall level controls travel
     // speed while bass/mids/highs independently influence the spatial drift.
     // Silence freezes the current pattern in place.
     if (audioReactive.dissolveMotionResponse > 0 && audio.level > 0) {
-        dissolveMotionPhase += audio.level * audioReactive.dissolveMotionResponse * animationDelta * 2.5;
+        dissolveMotionPhase += audio.level * audioReactive.dissolveMotionResponse * delta * 2.5;
 
         dissolveUniformData.uMotionAngle.value = dissolveMotionPhase;
         dissolveUniformData.uMotionOffset.value.set(
@@ -3885,26 +4017,6 @@ function animate() {
         dissolveMotionPhase = 0;
         dissolveUniformData.uMotionAngle.value = 0;
         dissolveUniformData.uMotionOffset.value.set(0, 0, 0);
-    }
-
-    enforceAudioLoopRange();
-
-    if (animationNow - lastTransportUiUpdate >= 200) {
-        const duration = getTransportDuration();
-        const currentTime = getTransportTime();
-        audioInfo.currentTime = formatTime(currentTime);
-        audioInfo.seekPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-        if (exportFrameInterval > 0) {
-            // The pane is behind an opaque modal, so refreshing its widgets is
-            // pure overhead during the one task that needs every millisecond.
-            updateExportModal();
-        } else {
-            refreshSeekBinding();
-            const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
-            if (timeBinding) timeBinding.refresh();
-            if (tweaks.meshAutoRotate) refreshRotationYBinding();
-        }
-        lastTransportUiUpdate = animationNow;
     }
 
     const meshScale = 1 + audio.bass * audioReactive.lowMeshSizeResponse;
@@ -3923,22 +4035,14 @@ function animate() {
     // the swarm accelerates with the track and settles back in silence.
     particleData.particleSpeedFactor = baseParticleSpeed * (1 + audio.level * audioReactive.particleSpeedResponse);
 
-    updateCameraMotion(time, audio, animationDelta);
+    updateCameraMotion(time, audio, delta);
 
-    // During export, compensate particle integration for any missed display
-    // frames so particle motion stays on the audio timeline instead of slowing
-    // down when the browser cannot present every requested export frame.
-    const particleFrameScale = exportFrameInterval > 0 ? Math.max(0, animationDelta * 60) : 1;
-    updateParticleAttributes(particleFrameScale);
+    // Particle integration is expressed against a 60 fps reference so the swarm
+    // advances by wall-clock time rather than by frame count. At 60 fps this is
+    // exactly the historical step.
+    updateParticleAttributes(Math.max(0, delta * 60));
 
     floatMeshes(time);
-
-    if (resizeRendererToDisplaySize()) {
-        const canvas = re.domElement;
-        cam.aspect = canvas.clientWidth / canvas.clientHeight;
-        cam.updateProjectionMatrix();
-    }
-
 
     scene.background = blackColor;
     effectComposer1.render();
@@ -3946,25 +4050,56 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
-    if (mediaRecorder?.state === 'recording') exportFramesRendered++;
-
-    if (mediaRecorder?.state === 'recording' && exportStopAt != null && getTransportTime() >= exportStopAt - 0.02) {
-        pauseTransport();
-        stopVideoExport();
-    }
-
     // Restore baseline values so audio reactivity never rewrites user controls.
     particlesUniformData.uBaseSize.value = baseParticleSize;
     particleData.particleSpeedFactor = baseParticleSpeed;
     unrealBloomPass.strength = baseBloomStrength;
     dissolveUniformData.uEdgeBloomBoost.value = 1;
+}
+
+
+function animate() {
+    // The offline exporter drives renderVisualizationFrame() itself on a fixed
+    // frame clock. Letting the preview loop render at the same time would fight
+    // it for the canvas that VideoFrame is about to read.
+    if (offlineExportActive) {
+        requestAnimationFrame(animate);
+        return;
+    }
+
+    const animationNow = performance.now();
+    const time = clock.getElapsedTime();
+    const animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
+    previousAnimationTime = animationNow;
+
+    enforceAudioLoopRange();
+
+    if (animationNow - lastTransportUiUpdate >= 200) {
+        const duration = getTransportDuration();
+        const currentTime = getTransportTime();
+        audioInfo.currentTime = formatTime(currentTime);
+        audioInfo.seekPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
+        refreshSeekBinding();
+        const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
+        if (timeBinding) timeBinding.refresh();
+        if (tweaks.meshAutoRotate) refreshRotationYBinding();
+        lastTransportUiUpdate = animationNow;
+    }
+
+    if (resizeRendererToDisplaySize()) {
+        const canvas = re.domElement;
+        cam.aspect = canvas.clientWidth / canvas.clientHeight;
+        cam.updateProjectionMatrix();
+    }
+
+    renderVisualizationFrame(time, animationDelta, readAudioLevels());
 
     fpsFrameCount++;
     const now = performance.now();
     const fpsElapsed = now - fpsSampleStart;
     if (fpsElapsed >= 500) {
         performanceStats.fps = Math.round((fpsFrameCount * 1000) / fpsElapsed);
-        if (fpsBinding && exportFrameInterval <= 0) fpsBinding.refresh();
+        if (fpsBinding) fpsBinding.refresh();
         fpsFrameCount = 0;
         fpsSampleStart = now;
     }
