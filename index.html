@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#000000" />
     <title>Dissolve Effect</title>
-    <link rel="stylesheet" href="./style.css?v=20260814-mesh-material-1" />
+    <link rel="stylesheet" href="./style.css?v=20260815-export-modal-1" />
     <script type="importmap">
       {
         "imports": {
@@ -40,6 +40,29 @@
       </div>
     </div>
 
-    <script type="module" src="./js/main.js?v=20260815-visual-quality-1"></script>
+    <div id="export-modal" class="export-modal" hidden>
+      <div class="export-modal__panel" role="dialog" aria-modal="true" aria-labelledby="export-modal-title" aria-live="polite">
+        <div class="export-modal__header">
+          <span id="export-modal-title" class="export-modal__title">Exporting video</span>
+          <span id="export-modal-format" class="export-modal__format"></span>
+        </div>
+        <div id="export-modal-status" class="export-modal__status">Preparing…</div>
+        <div class="export-modal__track" aria-hidden="true">
+          <div id="export-modal-fill" class="export-modal__fill"></div>
+        </div>
+        <div class="export-modal__meta">
+          <span id="export-modal-percent">0%</span>
+          <span id="export-modal-time">0:00 / 0:00</span>
+        </div>
+        <div class="export-modal__meta export-modal__meta--dim">
+          <span id="export-modal-frames">0 frames</span>
+          <span id="export-modal-fps">—</span>
+        </div>
+        <p class="export-modal__note">The video is a live capture of the canvas, so rendering continues behind this panel. Keep this tab in the foreground until the export finishes.</p>
+        <button id="export-modal-cancel" type="button" class="export-modal__cancel">Cancel export</button>
+      </div>
+    </div>
+
+    <script type="module" src="./js/main.js?v=20260815-export-modal-1"></script>
   </body>
 </html>

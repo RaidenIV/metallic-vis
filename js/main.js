@@ -2980,7 +2980,17 @@ let exportOverrideSize = null;
 let mediaRecorder = null;
 let recordedChunks = [];
 let exportStopAt = null;
+let exportStartAt = 0;
 let exportPreviousLoop = false;
+// Frame pacing state. While these are active the render loop runs on an even
+// 1/fps grid instead of whatever cadence requestAnimationFrame happens to give.
+let exportFrameInterval = 0;
+let exportNextFrameTime = 0;
+let exportVideoTrack = null;
+let exportManualFrameCapture = false;
+let exportFramesCaptured = 0;
+let exportBeganAt = 0;
+const EXPORT_FRAME_TOLERANCE_MS = 1.5;
 
 function getExportDimensions() {
     const shortSideMap = { '1080': 1080, '2K': 1440, '4K': 2160 };
@@ -3192,6 +3202,76 @@ function stopVideoExport() {
     if (mediaRecorder?.state === 'recording') mediaRecorder.stop();
 }
 
+
+// --- Export progress modal -------------------------------------------------
+// The canvas has to keep rendering for the whole export: the video track is a
+// live capture of it, so pausing the visualization would record a frozen frame.
+// What the modal does instead is cover it completely with an opaque panel and
+// block interaction, and while it is up the render loop skips every Tweakpane
+// DOM refresh, which is the only per-frame work that is genuinely wasted when
+// the panel is hidden.
+const exportModalRefs = {};
+
+function getExportModalRefs() {
+    if (exportModalRefs.root !== undefined) return exportModalRefs;
+    exportModalRefs.root = document.getElementById('export-modal');
+    exportModalRefs.fill = document.getElementById('export-modal-fill');
+    exportModalRefs.percent = document.getElementById('export-modal-percent');
+    exportModalRefs.time = document.getElementById('export-modal-time');
+    exportModalRefs.frames = document.getElementById('export-modal-frames');
+    exportModalRefs.fps = document.getElementById('export-modal-fps');
+    exportModalRefs.status = document.getElementById('export-modal-status');
+    exportModalRefs.format = document.getElementById('export-modal-format');
+    exportModalRefs.cancel = document.getElementById('export-modal-cancel');
+    if (exportModalRefs.cancel) {
+        exportModalRefs.cancel.addEventListener('click', () => {
+            if (exportModalRefs.status) exportModalRefs.status.textContent = 'Finishing current segment…';
+            pauseTransport();
+            stopVideoExport();
+        });
+    }
+    return exportModalRefs;
+}
+
+function showExportModal(frameRate) {
+    const refs = getExportModalRefs();
+    if (!refs.root) return;
+    const size = exportOverrideSize || getExportDimensions();
+    if (refs.format) refs.format.textContent = `${size.width}x${size.height} · ${frameRate} fps`;
+    if (refs.status) refs.status.textContent = 'Capturing frames…';
+    if (refs.fill) refs.fill.style.width = '0%';
+    if (refs.percent) refs.percent.textContent = '0%';
+    if (refs.frames) refs.frames.textContent = '0 frames';
+    if (refs.fps) refs.fps.textContent = '—';
+    refs.root.hidden = false;
+    document.body.classList.add('exporting');
+}
+
+function hideExportModal() {
+    const refs = getExportModalRefs();
+    if (refs.root) refs.root.hidden = true;
+    document.body.classList.remove('exporting');
+}
+
+function updateExportModal() {
+    const refs = getExportModalRefs();
+    if (!refs.root || refs.root.hidden) return;
+
+    const span = Math.max(0, (exportStopAt ?? 0) - exportStartAt);
+    const elapsed = Math.max(0, getTransportTime() - exportStartAt);
+    const ratio = span > 0 ? clamp(elapsed / span, 0, 1) : 0;
+
+    if (refs.fill) refs.fill.style.width = `${(ratio * 100).toFixed(1)}%`;
+    if (refs.percent) refs.percent.textContent = `${Math.round(ratio * 100)}%`;
+    if (refs.time) refs.time.textContent = `${formatTime(elapsed)} / ${formatTime(span)}`;
+    if (refs.frames) refs.frames.textContent = `${exportFramesCaptured.toLocaleString()} frames`;
+    if (refs.fps) {
+        const wall = (performance.now() - exportBeganAt) / 1000;
+        const captureRate = wall > 0.5 ? exportFramesCaptured / wall : 0;
+        refs.fps.textContent = captureRate > 0 ? `${captureRate.toFixed(1)} fps captured` : '—';
+    }
+}
+
 async function startVideoExport() {
     if (mediaRecorder?.state === 'recording') {
         stopVideoExport();
@@ -3214,9 +3294,25 @@ async function startVideoExport() {
     resizeRendererToDisplaySize();
 
     const frameRate = Number(exportSettings.frameRate) || 60;
-    const canvasStream = cnvs.captureStream(frameRate);
-    const videoTrack = canvasStream.getVideoTracks()[0];
+
+    // captureStream(0) hands frame timing to us instead of letting the browser
+    // sample the canvas on its own schedule. Paired with the pacer in animate(),
+    // every encoded frame corresponds to exactly one render, evenly spaced in
+    // scene time. Left to itself the browser duplicates and drops frames around
+    // an uneven requestAnimationFrame cadence, which is what made rotating
+    // camera presets read as a lower frame rate.
+    let canvasStream = cnvs.captureStream(0);
+    let videoTrack = canvasStream.getVideoTracks()[0];
+    exportManualFrameCapture = Boolean(videoTrack && typeof videoTrack.requestFrame === 'function');
+    if (!exportManualFrameCapture) {
+        // Safari and older engines have no requestFrame; fall back to the timed
+        // capture, where the pacer still keeps render spacing even.
+        canvasStream.getTracks().forEach((track) => track.stop());
+        canvasStream = cnvs.captureStream(frameRate);
+        videoTrack = canvasStream.getVideoTracks()[0];
+    }
     if (videoTrack && 'contentHint' in videoTrack) videoTrack.contentHint = 'motion';
+    exportVideoTrack = videoTrack || null;
     const tracks = videoTrack ? [videoTrack] : [];
     if (recordingDestination?.stream?.getAudioTracks().length) {
         tracks.push(...recordingDestination.stream.getAudioTracks());
@@ -3242,6 +3338,8 @@ async function startVideoExport() {
         exportSettings.status = 'Video exported';
         mediaRecorder = null;
         exportStopAt = null;
+        endExportFramePacing();
+        hideExportModal();
         loopSettings.enabled = exportPreviousLoop;
         updateAudioLoopMode();
         refreshPane();
@@ -3256,10 +3354,36 @@ async function startVideoExport() {
     updateAudioLoopMode();
     seekTransport(start);
     exportStopAt = end;
+    exportStartAt = start;
     exportSettings.status = 'Exporting video…';
+    beginExportFramePacing(frameRate);
+    showExportModal(frameRate);
     mediaRecorder.start(500);
     await playTransport();
     refreshPane();
+}
+
+
+function beginExportFramePacing(frameRate) {
+    exportFrameInterval = frameRate > 0 ? 1000 / frameRate : 0;
+    exportNextFrameTime = performance.now();
+    exportFramesCaptured = 0;
+    exportBeganAt = performance.now();
+}
+
+
+function endExportFramePacing() {
+    exportFrameInterval = 0;
+    exportNextFrameTime = 0;
+    if (exportVideoTrack) {
+        try {
+            exportVideoTrack.stop();
+        } catch (error) {
+            console.warn('Capture track could not be stopped.', error);
+        }
+    }
+    exportVideoTrack = null;
+    exportManualFrameCapture = false;
 }
 
 fitViewport();
@@ -3713,8 +3837,24 @@ let dissolveMotionPhase = 0;
 let previousAnimationTime = performance.now();
 let lastTransportUiUpdate = 0;
 function animate() {
-    let time = clock.getElapsedTime();
     const animationNow = performance.now();
+
+    // Export frame pacing. Camera presets are parametric on wall-clock time, so
+    // the paths themselves are smooth; what read as a dropped frame rate was the
+    // encoder receiving frames at whatever irregular interval the display
+    // happened to deliver. Rendering only when the next 1/fps slot is due gives
+    // the encoder evenly spaced scene time, which is what rotation needs.
+    if (exportFrameInterval > 0) {
+        if (animationNow + EXPORT_FRAME_TOLERANCE_MS < exportNextFrameTime) {
+            requestAnimationFrame(animate);
+            return;
+        }
+        // Clamping to now stops the schedule from trying to claw back a backlog
+        // after a slow frame, which would bunch several renders together.
+        exportNextFrameTime = Math.max(animationNow, exportNextFrameTime + exportFrameInterval);
+    }
+
+    let time = clock.getElapsedTime();
     const animationDelta = Math.min(0.1, Math.max(0, (animationNow - previousAnimationTime) / 1000));
     previousAnimationTime = animationNow;
 
@@ -3755,10 +3895,16 @@ function animate() {
         const currentTime = getTransportTime();
         audioInfo.currentTime = formatTime(currentTime);
         audioInfo.seekPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-        refreshSeekBinding();
-        const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
-        if (timeBinding) timeBinding.refresh();
-        if (tweaks.meshAutoRotate) refreshRotationYBinding();
+        if (exportFrameInterval > 0) {
+            // The pane is behind an opaque modal, so refreshing its widgets is
+            // pure overhead during the one task that needs every millisecond.
+            updateExportModal();
+        } else {
+            refreshSeekBinding();
+            const timeBinding = audioInfoBindings[audioInfoBindings.length - 1];
+            if (timeBinding) timeBinding.refresh();
+            if (tweaks.meshAutoRotate) refreshRotationYBinding();
+        }
         lastTransportUiUpdate = animationNow;
     }
 
@@ -3797,6 +3943,11 @@ function animate() {
     scene.background = activeBackgroundTexture || cubeTexture || blackColor;
     effectComposer2.render();
 
+    if (mediaRecorder?.state === 'recording') {
+        if (exportManualFrameCapture && exportVideoTrack) exportVideoTrack.requestFrame();
+        exportFramesCaptured++;
+    }
+
     if (mediaRecorder?.state === 'recording' && exportStopAt != null && getTransportTime() >= exportStopAt - 0.02) {
         pauseTransport();
         stopVideoExport();
@@ -3813,7 +3964,7 @@ function animate() {
     const fpsElapsed = now - fpsSampleStart;
     if (fpsElapsed >= 500) {
         performanceStats.fps = Math.round((fpsFrameCount * 1000) / fpsElapsed);
-        if (fpsBinding) fpsBinding.refresh();
+        if (fpsBinding && exportFrameInterval <= 0) fpsBinding.refresh();
         fpsFrameCount = 0;
         fpsSampleStart = now;
     }
